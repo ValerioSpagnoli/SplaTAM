@@ -4,6 +4,7 @@ data/
 experiments/
 results/
 wandb/
+openai.api.key
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
