@@ -1,7 +1,7 @@
 import os
 from os.path import join as p_join
 
-scene_name = "room0"
+scene_name = "office0"
 primary_device = "cuda:0"
 seed = 0
 
