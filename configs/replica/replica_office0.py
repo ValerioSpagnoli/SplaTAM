@@ -48,8 +48,8 @@ config = dict(
         desired_image_height=680,
         desired_image_width=1200,
         start=0,
-        end=500,
-        stride=1,
+        end=-1,
+        stride=100,
         num_frames=-1,
     ),
     tracking=dict(
