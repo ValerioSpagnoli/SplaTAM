@@ -2,7 +2,8 @@
 name = "splatam"
 version = "0.1.0"
 description = "SplaTAM with CUDA 13.0 / PyTorch 2.9"
-channels = ["conda-forge"]
+channels = ["nvidia/label/cuda-13.0.0", "conda-forge"]
+channel-priority = "disabled"
 platforms = ["linux-64"]
 
 [system-requirements]
@@ -13,6 +14,7 @@ linux = "6.0"
 python = "3.10.*"
 pip = "*"
 compilers = "*"
+cuda-toolkit = "13.0.*"
 numpy = "<2"
 
 [pypi-dependencies]
