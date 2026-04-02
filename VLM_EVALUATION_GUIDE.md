@@ -36,6 +36,115 @@ Quality > 0.7:  "HIGH quality render — well-observed, fairly accurate"
 
 ---
 
+## VLM Prompts
+
+All three conditions use the same base questions but with different context depending on the condition.
+
+### Base Task Questions (Used in All Conditions)
+
+```
+Answer the following questions about this image:
+
+1. **Room type:** What type of room is this? (e.g., bedroom, kitchen, office, bathroom, living room, hallway)
+2. **Objects:** List all objects you can clearly identify in this image. Only list objects you are confident about.
+3. **Confidence:** Rate your overall confidence in your answers: high, medium, or low.
+4. **Navigation decision:** You are a robot exploring this environment. Based on this view, should you:
+   (a) Search this area for useful objects
+   (b) Move on and explore elsewhere
+   (c) Request a better observation of this area (e.g., move closer or get a different angle)
+
+Respond in JSON format:
+{
+  "room_type": "...",
+  "objects": ["obj1", "obj2", ...],
+  "confidence": "high/medium/low",
+  "navigation_decision": "a/b/c",
+  "reasoning": "brief explanation"
+}
+```
+
+### Condition A: Baseline Prompt
+
+**Input:** Rendered 3DGS image  
+**Prompt:** Base task questions only (no context)
+
+```
+[Image: rendered_frame.png]
+
+Answer the following questions about this image:
+1. Room type: ...
+2. Objects: ...
+3. Confidence: ...
+4. Navigation decision: ...
+```
+
+### Condition B: Uncertainty-Annotated Prompt
+
+**Input:** Same rendered 3DGS image as Condition A  
+**Prompt:** Uncertainty context + base task questions
+
+**For LOW quality (score < 0.4):**
+```
+IMPORTANT CONTEXT: This image was rendered from an online 3D Gaussian Splatting 
+reconstruction. The estimated reconstruction quality for this viewpoint is 
+0.15/1.00. This is a LOW quality render — the region was poorly observed during 
+mapping. The image likely contains significant artifacts, missing geometry, or 
+incorrect colors. Be cautious about identifying objects in this view.
+
+[Image: rendered_frame.png]
+
+Answer the following questions about this image:
+1. Room type: ...
+2. Objects: ...
+3. Confidence: ...
+4. Navigation decision: ...
+```
+
+**For MEDIUM quality (0.4 ≤ score < 0.7):**
+```
+IMPORTANT CONTEXT: This image was rendered from an online 3D Gaussian Splatting 
+reconstruction. The estimated reconstruction quality for this viewpoint is 
+0.52/1.00. This is a MEDIUM quality render — the region was partially observed 
+during mapping. Some areas may contain artifacts or incomplete reconstruction.
+
+[Image: rendered_frame.png]
+
+Answer the following questions about this image:
+...
+```
+
+**For HIGH quality (score ≥ 0.7):**
+```
+IMPORTANT CONTEXT: This image was rendered from an online 3D Gaussian Splatting 
+reconstruction. The estimated reconstruction quality for this viewpoint is 
+0.85/1.00. This is a HIGH quality render — the region was well-observed during 
+mapping. The rendering should be fairly accurate.
+
+[Image: rendered_frame.png]
+
+Answer the following questions about this image:
+...
+```
+
+### Condition C: Ground Truth Prompt
+
+**Input:** Actual RGB image from dataset (not 3DGS render)  
+**Prompt:** Base task questions only (no context)
+
+```
+[Image: ground_truth_frame.jpg]
+
+Answer the following questions about this image:
+1. Room type: ...
+2. Objects: ...
+3. Confidence: ...
+4. Navigation decision: ...
+```
+
+**Note:** Condition C is identical to Condition A in terms of prompt structure, but uses the ground truth image instead of the 3DGS render. This establishes the performance ceiling.
+
+---
+
 ## Metrics Measured
 
 ### 1. **Room Type Classification**

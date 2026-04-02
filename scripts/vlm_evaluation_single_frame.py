@@ -235,7 +235,7 @@ def call_vlm(messages: list, api_key: str, model: str = "gpt-4o") -> dict:
     payload = {
         "model": model,
         "messages": messages,
-        "max_tokens": 500,
+        "max_tokens": 1000,
         "temperature": 0.0,  # deterministic for reproducibility
     }
 
