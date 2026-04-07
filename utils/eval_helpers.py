@@ -314,11 +314,12 @@ def eval_online(dataset, all_params, num_frames, eval_online_dir, sil_thres,
         if time_idx == 0:
             # Process Camera Parameters
             first_frame_w2c = torch.linalg.inv(pose)
-            # Setup Camera
-            cam = setup_camera(color.shape[2], color.shape[1], intrinsics.cpu().numpy(), first_frame_w2c.detach().cpu().numpy())
+            # Gaussians are transformed into camera frame before rendering; camera extrinsics must be identity.
+            identity_w2c = torch.eye(4, device=first_frame_w2c.device, dtype=first_frame_w2c.dtype)
+            cam = setup_camera(color.shape[2], color.shape[1], intrinsics.cpu().numpy(), identity_w2c.detach().cpu().numpy())
         
         # Define current frame data
-        curr_data = {'cam': cam, 'im': color, 'depth': depth, 'id': time_idx, 'intrinsics': intrinsics, 'w2c': first_frame_w2c}
+        curr_data = {'cam': cam, 'im': color, 'depth': depth, 'id': time_idx, 'intrinsics': intrinsics, 'w2c': identity_w2c}
 
         # Get current frame Gaussians
         transformed_gaussians = transform_to_frame(params, time_idx, 
@@ -327,7 +328,7 @@ def eval_online(dataset, all_params, num_frames, eval_online_dir, sil_thres,
 
         # Initialize Render Variables
         rendervar = transformed_params2rendervar(params, transformed_gaussians)
-        depth_sil_rendervar = transformed_params2depthplussilhouette(params, first_frame_w2c,
+        depth_sil_rendervar = transformed_params2depthplussilhouette(params, identity_w2c,
                                                                      transformed_gaussians)
         
         # Render Depth & Silhouette
@@ -456,8 +457,9 @@ def eval(dataset, final_params, num_frames, eval_dir, sil_thres,
         if time_idx == 0:
             # Process Camera Parameters
             first_frame_w2c = torch.linalg.inv(pose)
-            # Setup Camera
-            cam = setup_camera(color.shape[2], color.shape[1], intrinsics.cpu().numpy(), first_frame_w2c.detach().cpu().numpy())
+            # Gaussians are transformed into camera frame before rendering; camera extrinsics must be identity.
+            identity_w2c = torch.eye(4, device=first_frame_w2c.device, dtype=first_frame_w2c.dtype)
+            cam = setup_camera(color.shape[2], color.shape[1], intrinsics.cpu().numpy(), identity_w2c.detach().cpu().numpy())
         
         # Skip frames if not eval_every
         if time_idx != 0 and (time_idx+1) % eval_every != 0:
@@ -469,12 +471,14 @@ def eval(dataset, final_params, num_frames, eval_dir, sil_thres,
                                                    camera_grad=False)
  
         # Define current frame data
-        curr_data = {'cam': cam, 'im': color, 'depth': depth, 'id': time_idx, 'intrinsics': intrinsics, 'w2c': first_frame_w2c}
+        curr_data = {'cam': cam, 'im': color, 'depth': depth, 'id': time_idx, 'intrinsics': intrinsics, 'w2c': identity_w2c}
 
         # Initialize Render Variables
         rendervar = transformed_params2rendervar(final_params, transformed_gaussians)
-        depth_sil_rendervar = transformed_params2depthplussilhouette(final_params, curr_data['w2c'],
-                                                                     transformed_gaussians)
+        # transformed_gaussians are already in the current camera frame;
+        # use identity w2c to avoid applying camera transform twice for depth.
+        depth_sil_rendervar = transformed_params2depthplussilhouette(final_params, identity_w2c,
+                                         transformed_gaussians)
 
         # Render Depth & Silhouette
         depth_sil, _, _, = Renderer(raster_settings=curr_data['cam'])(**depth_sil_rendervar)
@@ -685,8 +689,9 @@ def eval_nvs(dataset, final_params, num_frames, eval_dir, sil_thres,
         if time_idx == 0:
             # Process Camera Parameters
             first_frame_w2c = torch.linalg.inv(pose)
-            # Setup Camera
-            cam = setup_camera(color.shape[2], color.shape[1], intrinsics.cpu().numpy(), first_frame_w2c.detach().cpu().numpy())
+            # Gaussians are transformed into camera frame before rendering; camera extrinsics must be identity.
+            identity_w2c = torch.eye(4, device=first_frame_w2c.device, dtype=first_frame_w2c.dtype)
+            cam = setup_camera(color.shape[2], color.shape[1], intrinsics.cpu().numpy(), identity_w2c.detach().cpu().numpy())
             # Skip first train frame eval for NVS
             continue
         
@@ -718,12 +723,14 @@ def eval_nvs(dataset, final_params, num_frames, eval_dir, sil_thres,
             transformed_gaussians['unnorm_rotations'] = final_params['unnorm_rotations'].detach()
  
         # Define current frame data
-        curr_data = {'cam': cam, 'im': color, 'depth': depth, 'id': time_idx, 'intrinsics': intrinsics, 'w2c': first_frame_w2c}
+        curr_data = {'cam': cam, 'im': color, 'depth': depth, 'id': time_idx, 'intrinsics': intrinsics, 'w2c': identity_w2c}
 
         # Initialize Render Variables
         rendervar = transformed_params2rendervar(final_params, transformed_gaussians)
-        depth_sil_rendervar = transformed_params2depthplussilhouette(final_params, curr_data['w2c'],
-                                                                     transformed_gaussians)
+        # transformed_gaussians are already in the current camera frame;
+        # use identity w2c to avoid applying camera transform twice for depth.
+        depth_sil_rendervar = transformed_params2depthplussilhouette(final_params, identity_w2c,
+                                         transformed_gaussians)
 
         # Render Depth & Silhouette
         depth_sil, _, _, = Renderer(raster_settings=curr_data['cam'])(**depth_sil_rendervar)

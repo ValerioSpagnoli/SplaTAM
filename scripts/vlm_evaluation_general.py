@@ -7,28 +7,21 @@ import time
 from glob import glob
 
 
-TASK_QUESTIONS = """ 
-Describe which objects are visible in the scene and which is their spatial relationship and how distant are from the robot.
-Answer in JSON format with the following structure:
-{
-  "objects": [
-    {
-      "name": "object name or category",
-      "relationship_to_robot": "description of spatial relationship to the robot (e.g., 'to the left', 'in front')",
-      "distance": "estimated distance from the robot (metric)",
-      "spatial_relationships": [
-        {
-          "other_object": "name of another object",
-          "relationship_to_object": "description of spatial relationship (e.g., 'to the left of', 'in front of')"
-          "distance": "estimated distance between the two objects (metric)"
-        },
-        ...
-      ]
-    },
-    ...
-  ]
-}
+TASK_QUESTIONS = """
+Determine the spatial relationship between the computer monitor and the cardboard box.
 
+Use the depth input as metric information (meters) and prioritize depth evidence over ambiguous RGB cues.
+If the relationship cannot be determined reliably, return "uncertain" and request a new rendered view.
+Assume any requested new view will be rendered using 3DGS.
+
+Return only valid JSON (no markdown, no extra text) with exactly this schema:
+{
+    "spatial_relationship": "in front of" | "behind" | "to the left of" | "to the right of" | "above" | "below" | "uncertain",
+    "confidence": float (0.0 to 1.0),
+    "request_new_view": boolean,
+    "new_view_pose": string (if request_new_view is true, format: "x,y,z,roll,pitch,yaw"; otherwise ""),
+    "new_view_reasoning": string (if request_new_view is true, explain why that view disambiguates the relation; otherwise "")
+}
 """
 
 
@@ -246,7 +239,7 @@ def evaluate(
 
     eval_dir = os.path.join(experiment_dir, "eval")
     rgb_dir = os.path.join(eval_dir, "rendered_rgb" if use_rendered else "rgb")
-    depth_dir = os.path.join(eval_dir, "rendered_depth" if use_rendered else "depth")
+    depth_dir = os.path.join(eval_dir, "depth_metric")
 
     if not os.path.isdir(rgb_dir):
         print(f"Error: RGB directory not found: {rgb_dir}")
