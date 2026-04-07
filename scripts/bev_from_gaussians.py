@@ -277,6 +277,8 @@ def create_occupancy_grid(
     color_bev: torch.Tensor,
     depth_bev: torch.Tensor,
     opacity_threshold: float = 0.3,
+    min_component_area: int = 30,
+    morph_kernel: int = 3,
 ) -> np.ndarray:
     """Create an occupancy grid from the BEV rendering.
 
@@ -315,24 +317,42 @@ def create_occupancy_grid(
     # Unobserved: silhouette near 0 (no gaussians projected here)
     unobserved_mask = silhouette < 0.05
 
-    # Free space: high silhouette, moderate depth (floor-level)
-    # Occupied: high silhouette, varied depth (objects above floor)
+    # Free space from opacity confidence, occupied as complement among observed.
     observed_mask = ~unobserved_mask
 
-    # Normalize depth for observed regions
     if observed_mask.any():
-        obs_depth = depth[observed_mask]
-        depth_median = np.median(obs_depth)
-        depth_std = np.std(obs_depth)
-
-        # Floor-like regions have depth close to the camera (looking down)
-        # Objects/walls have different depth characteristics
-        # Threshold: regions near median depth = free, outliers = occupied
-        free_mask = observed_mask & (np.abs(depth - depth_median) < 1.5 * depth_std)
+        free_mask = observed_mask & (silhouette >= opacity_threshold)
         occupied_mask = observed_mask & ~free_mask
 
+        # Suppress tiny islands that typically come from sparse/noisy splats.
+        if min_component_area > 0:
+            try:
+                import cv2
+
+                free_u8 = (free_mask.astype(np.uint8) * 255)
+                occ_u8 = (occupied_mask.astype(np.uint8) * 255)
+
+                if morph_kernel > 1:
+                    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (morph_kernel, morph_kernel))
+                    free_u8 = cv2.morphologyEx(free_u8, cv2.MORPH_OPEN, k)
+                    free_u8 = cv2.morphologyEx(free_u8, cv2.MORPH_CLOSE, k)
+                    occ_u8 = cv2.morphologyEx(occ_u8, cv2.MORPH_OPEN, k)
+
+                def drop_small(mask_u8):
+                    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
+                    out = np.zeros_like(mask_u8)
+                    for cid in range(1, n):
+                        if stats[cid, cv2.CC_STAT_AREA] >= min_component_area:
+                            out[labels == cid] = 255
+                    return out
+
+                free_mask = drop_small(free_u8) > 0
+                occupied_mask = drop_small(occ_u8) > 0
+            except Exception:
+                pass
+
         occupancy[free_mask] = [255, 255, 255]       # White = free
-        occupancy[occupied_mask] = [40, 40, 40]       # Dark gray = occupied
+        occupancy[occupied_mask] = [40, 40, 40]      # Dark gray = occupied
         occupancy[unobserved_mask] = [128, 128, 128]  # Gray = unobserved
     else:
         occupancy[:] = [128, 128, 128]
@@ -462,12 +482,84 @@ def create_quality_map_fast(
     return quality
 
 
+def infer_default_traj_path(params_path: str) -> str:
+    """Infer dataset trajectory file from an experiments/<group>/<run>/params*.npz path."""
+    p = os.path.normpath(params_path)
+    parts = p.split(os.sep)
+    try:
+        exp_idx = parts.index("experiments")
+    except ValueError:
+        return ""
+
+    if exp_idx + 2 >= len(parts):
+        return ""
+
+    group = parts[exp_idx + 1]
+    run_name = parts[exp_idx + 2]
+    # Typical run name is <scene>_<seed>, e.g., office0_0.
+    scene = run_name.rsplit("_", 1)[0] if "_" in run_name else run_name
+    candidate = os.path.join("data", group, scene, "traj.txt")
+    return candidate if os.path.isfile(candidate) else ""
+
+
+def load_positions_from_traj_txt(traj_path: str, target_len: int = 0) -> np.ndarray:
+    """Load c2w trajectory and convert to frame-0 relative positions."""
+    with open(traj_path, "r") as f:
+        lines = [ln.strip() for ln in f.readlines() if ln.strip()]
+    if not lines:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    poses = np.array([np.fromstring(ln, sep=" ") for ln in lines], dtype=np.float64)
+    poses = poses.reshape(-1, 4, 4)
+    c2w0_inv = np.linalg.inv(poses[0])
+    rel_c2w = np.einsum("ij,njk->nik", c2w0_inv, poses)
+    positions = rel_c2w[:, :3, 3].astype(np.float32)
+
+    if target_len > 0 and len(positions) != target_len:
+        idx = np.linspace(0, len(positions) - 1, target_len).round().astype(np.int64)
+        positions = positions[idx]
+    return positions
+
+
+def load_positions_from_params(params: dict) -> np.ndarray:
+    """Load camera positions from params cam_{rot,trans} tensors."""
+    if 'cam_trans' not in params or 'cam_unnorm_rots' not in params:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    cam_trans = params['cam_trans']
+    cam_rots = params['cam_unnorm_rots']
+    num_frames = cam_trans.shape[-1]
+
+    w2c_init = params.get('w2c', None)
+    if w2c_init is not None and w2c_init.dim() == 1:
+        w2c_init = w2c_init.reshape(4, 4)
+
+    positions_world = []
+    from utils.slam_external import build_rotation
+    for t in range(num_frames):
+        cam_rot = F.normalize(cam_rots[..., t])
+        cam_tran = cam_trans[..., t]
+
+        rel_w2c = torch.eye(4).cuda().float()
+        rel_w2c[:3, :3] = build_rotation(cam_rot)
+        rel_w2c[:3, 3] = cam_tran
+        full_w2c = rel_w2c if w2c_init is None else (rel_w2c @ w2c_init)
+        cam_pos = torch.inverse(full_w2c)[:3, 3]
+        positions_world.append(cam_pos.cpu().numpy())
+
+    return np.array(positions_world, dtype=np.float32)
+
+
 def add_trajectory_overlay(
     bev_image: np.ndarray,
     params: dict,
     scene_min: torch.Tensor,
     scene_max: torch.Tensor,
     up_axis_idx: int = 1,
+    smoothing_window: int = 9,
+    trajectory_source: str = "auto",
+    traj_path: str = "",
+    params_path: str = "",
 ) -> np.ndarray:
     """Overlay camera trajectory on the BEV image.
 
@@ -483,40 +575,35 @@ def add_trajectory_overlay(
     h, w = bev_image.shape[:2]
     overlay = bev_image.copy()
 
-    if 'cam_trans' not in params:
+    target_len = int(params['cam_trans'].shape[-1]) if 'cam_trans' in params else 0
+    positions_params = load_positions_from_params(params)
+    positions_world = positions_params
+
+    if trajectory_source in ["gt", "auto"]:
+        use_gt = trajectory_source == "gt"
+        if trajectory_source == "auto" and len(positions_params) > 1:
+            traj_spread = np.ptp(positions_params, axis=0)
+            # If estimated trajectory is nearly degenerate, fallback to GT traj file.
+            use_gt = float(np.linalg.norm(traj_spread)) < 0.1
+
+        if use_gt:
+            resolved_traj = traj_path if traj_path else infer_default_traj_path(params_path)
+            if resolved_traj:
+                try:
+                    positions_world = load_positions_from_traj_txt(resolved_traj, target_len=target_len)
+                except Exception as exc:
+                    print(f"Warning: failed to load GT trajectory from {resolved_traj}: {exc}")
+
+    if len(positions_world) == 0:
         return overlay
 
-    # Get camera positions from params
-    cam_trans = params['cam_trans']  # (1, 3, num_frames)
-    if 'cam_unnorm_rots' in params:
-        cam_rots = params['cam_unnorm_rots']  # (1, 4, num_frames)
-
-    num_frames = cam_trans.shape[-1]
-
-    # Get world positions of cameras
-    # cam_trans and cam_unnorm_rots define relative w2c transforms
-    # We need to compose with the initial w2c to get world positions
-    w2c_init = params.get('w2c', torch.eye(4).cuda().float())
-    if w2c_init.dim() == 1:
-        w2c_init = w2c_init.reshape(4, 4)
-    c2w_init = torch.inverse(w2c_init)
-
-    positions_world = []
-    for t in range(num_frames):
-        cam_rot = F.normalize(cam_rots[..., t])
-        cam_tran = cam_trans[..., t]
-
-        from utils.slam_external import build_rotation
-        rel_w2c = torch.eye(4).cuda().float()
-        rel_w2c[:3, :3] = build_rotation(cam_rot)
-        rel_w2c[:3, 3] = cam_tran
-
-        # World position = inverse of (rel_w2c @ w2c_init) -> last column of inverse
-        full_w2c = rel_w2c
-        cam_pos = torch.inverse(full_w2c)[:3, 3]
-        positions_world.append(cam_pos.cpu().numpy())
-
-    positions_world = np.array(positions_world)
+    if smoothing_window > 1 and smoothing_window % 2 == 1 and len(positions_world) >= smoothing_window:
+        k = np.ones(smoothing_window, dtype=np.float32) / float(smoothing_window)
+        pad = smoothing_window // 2
+        for d in range(3):
+            v = positions_world[:, d]
+            v_pad = np.pad(v, (pad, pad), mode='edge')
+            positions_world[:, d] = np.convolve(v_pad, k, mode='valid')
 
     # Project to BEV image coordinates using the configured up axis.
     h0_idx, h1_idx = get_horizontal_axes(up_axis_idx)
@@ -524,8 +611,11 @@ def add_trajectory_overlay(
     z_min, z_max = scene_min[h1_idx].item(), scene_max[h1_idx].item()
 
     def world_to_pixel(x_world, z_world):
-        px = int((x_world - x_min) / (x_max - x_min) * (w - 1))
-        py = int((z_world - z_min) / (z_max - z_min) * (h - 1))
+        x_den = max(x_max - x_min, 1e-6)
+        z_den = max(z_max - z_min, 1e-6)
+        px = int((x_world - x_min) / x_den * (w - 1))
+        # Flip vertical axis to match top-down camera convention in setup_topdown_camera.
+        py = int((z_max - z_world) / z_den * (h - 1))
         return np.clip(px, 0, w - 1), np.clip(py, 0, h - 1)
 
     # Draw trajectory line in blue
@@ -588,6 +678,26 @@ def main():
     parser.add_argument(
         "--height_offset", type=float, default=5.0,
         help="Camera height above scene for top-down view",
+    )
+    parser.add_argument(
+        "--min_component_area", type=int, default=30,
+        help="Remove occupancy/free connected components smaller than this many pixels (0 disables).",
+    )
+    parser.add_argument(
+        "--morph_kernel", type=int, default=3,
+        help="Morphological kernel size for occupancy denoising (1 disables).",
+    )
+    parser.add_argument(
+        "--trajectory_smoothing", type=int, default=9,
+        help="Odd moving-average window for trajectory smoothing in BEV pixels (1 disables).",
+    )
+    parser.add_argument(
+        "--trajectory_source", type=str, default="auto", choices=["auto", "params", "gt"],
+        help="Trajectory source: params (estimated), gt (from traj.txt), or auto fallback.",
+    )
+    parser.add_argument(
+        "--traj_path", type=str, default="",
+        help="Optional path to traj.txt (c2w per line) used when trajectory_source=gt or auto fallback.",
     )
     parser.add_argument(
         "--up_axis", type=str, default="auto", choices=["auto", "x", "y", "z"],
@@ -657,6 +767,8 @@ def main():
     occupancy_grid = create_occupancy_grid(
         opacity_bev, opacity_depth_bev,
         opacity_threshold=args.occupancy_threshold,
+        min_component_area=args.min_component_area,
+        morph_kernel=args.morph_kernel,
     )
 
     # ── 4. Create quality heatmap ──
@@ -667,13 +779,28 @@ def main():
     if not args.no_trajectory:
         print("Adding trajectory overlays...")
         rgb_with_traj = add_trajectory_overlay(
-            rgb_np, params, scene_min, scene_max, up_axis_idx=up_axis_idx
+            rgb_np, params, scene_min, scene_max,
+            up_axis_idx=up_axis_idx,
+            smoothing_window=args.trajectory_smoothing,
+            trajectory_source=args.trajectory_source,
+            traj_path=args.traj_path,
+            params_path=args.params_path,
         )
         occupancy_with_traj = add_trajectory_overlay(
-            occupancy_grid, params, scene_min, scene_max, up_axis_idx=up_axis_idx
+            occupancy_grid, params, scene_min, scene_max,
+            up_axis_idx=up_axis_idx,
+            smoothing_window=args.trajectory_smoothing,
+            trajectory_source=args.trajectory_source,
+            traj_path=args.traj_path,
+            params_path=args.params_path,
         )
         quality_with_traj = add_trajectory_overlay(
-            quality_map, params, scene_min, scene_max, up_axis_idx=up_axis_idx
+            quality_map, params, scene_min, scene_max,
+            up_axis_idx=up_axis_idx,
+            smoothing_window=args.trajectory_smoothing,
+            trajectory_source=args.trajectory_source,
+            traj_path=args.traj_path,
+            params_path=args.params_path,
         )
 
     # ── 6. Save outputs ──
