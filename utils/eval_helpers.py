@@ -535,7 +535,7 @@ def eval(dataset, final_params, num_frames, eval_dir, sil_thres,
             viz_render_depth = rastered_depth_viz[0].detach().cpu().numpy()
             normalized_depth = np.clip((viz_render_depth - vmin) / (vmax - vmin), 0, 1)
             depth_colormap = cv2.applyColorMap((normalized_depth * 255).astype(np.uint8), cv2.COLORMAP_JET)
-            cv2.imwrite(os.path.join(render_rgb_dir, "gs_{:04d}.png".format(time_idx)), cv2.cvtColor(viz_render_im*255, cv2.COLOR_RGB2BGR))
+            cv2.imwrite(os.path.join(render_rgb_dir, "gs_{:04d}.png".format(time_idx)), cv2.cvtColor((viz_render_im*255).astype(np.uint8), cv2.COLOR_RGB2BGR))
             cv2.imwrite(os.path.join(render_depth_dir, "gs_{:04d}.png".format(time_idx)), depth_colormap)
             save_metric_depth_png(
                 viz_render_depth,
@@ -548,7 +548,7 @@ def eval(dataset, final_params, num_frames, eval_dir, sil_thres,
             viz_gt_depth = curr_data['depth'][0].detach().cpu().numpy()
             normalized_depth = np.clip((viz_gt_depth - vmin) / (vmax - vmin), 0, 1)
             depth_colormap = cv2.applyColorMap((normalized_depth * 255).astype(np.uint8), cv2.COLORMAP_JET)
-            cv2.imwrite(os.path.join(rgb_dir, "gt_{:04d}.png".format(time_idx)), cv2.cvtColor(viz_gt_im*255, cv2.COLOR_RGB2BGR))
+            cv2.imwrite(os.path.join(rgb_dir, "gt_{:04d}.png".format(time_idx)), cv2.cvtColor((viz_gt_im*255).astype(np.uint8), cv2.COLOR_RGB2BGR))
             cv2.imwrite(os.path.join(depth_dir, "gt_{:04d}.png".format(time_idx)), depth_colormap)
             save_metric_depth_png(
                 viz_gt_depth,

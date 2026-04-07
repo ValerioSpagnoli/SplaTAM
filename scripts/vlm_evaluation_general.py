@@ -1,124 +1,233 @@
+"""
+Minimal VLM evaluation on a single frame.
+
+Loads frame data from eval/frames_index.csv and intrinsics from eval/camera_info.json.
+Renders an RGB image from the 3DGS map at the frame's camera pose, queries the VLM,
+and saves the result.
+
+Usage:
+  python scripts/vlm_evaluation_general.py \
+    --experiment_dir ./experiments/IsaacSim/office0_0 \
+    --image_idx 42 --model gpt-4o [--use_rendered]
+"""
 import argparse
 import base64
+import csv
 import json
+import math
 import os
 import sys
 import time
-from glob import glob
+
+import cv2
+import numpy as np
+import torch
+import httpx
+
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _BASE_DIR)
+
+from diff_gaussian_rasterization import GaussianRasterizer as Renderer
+from utils.recon_helpers import setup_camera
+from utils.slam_helpers import (
+    params2rendervar,
+    transform_to_frame,
+    transformed_params2rendervar,
+)
 
 
-TASK_QUESTIONS = """
+TASK_QUESTION = """
 Determine the spatial relationship between the computer monitor and the cardboard box.
-
-Use the depth input as metric information (meters) and prioritize depth evidence over ambiguous RGB cues.
-If the relationship cannot be determined reliably, return "uncertain" and request a new rendered view.
-Assume any requested new view will be rendered using 3DGS.
 
 Return only valid JSON (no markdown, no extra text) with exactly this schema:
 {
     "spatial_relationship": "in front of" | "behind" | "to the left of" | "to the right of" | "above" | "below" | "uncertain",
     "confidence": float (0.0 to 1.0),
-    "request_new_view": boolean,
-    "new_view_pose": string (if request_new_view is true, format: "x,y,z,roll,pitch,yaw"; otherwise ""),
-    "new_view_reasoning": string (if request_new_view is true, explain why that view disambiguates the relation; otherwise "")
+    "reasoning": string
 }
 """
 
 
-def encode_image_b64(image_path: str) -> str:
-    with open(image_path, "rb") as f:
+# ---------------------------------------------------------------------------
+# Pose helpers
+# ---------------------------------------------------------------------------
+
+def c2w_to_translation(c2w: np.ndarray) -> tuple[float, float, float]:
+    return float(c2w[0, 3]), float(c2w[1, 3]), float(c2w[2, 3])
+
+
+def c2w_to_rpy_deg(c2w: np.ndarray) -> tuple[float, float, float]:
+    """Extract roll, pitch, yaw (degrees) from a 4x4 c2w matrix."""
+    R = c2w[:3, :3]
+    sy = math.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
+    singular = sy < 1e-6
+    if not singular:
+        roll = math.atan2(R[2, 1], R[2, 2])
+        pitch = math.atan2(-R[2, 0], sy)
+        yaw = math.atan2(R[1, 0], R[0, 0])
+    else:
+        roll = math.atan2(-R[1, 2], R[1, 1])
+        pitch = math.atan2(-R[2, 0], sy)
+        yaw = 0.0
+    return math.degrees(roll), math.degrees(pitch), math.degrees(yaw)
+
+# Rotation helpers (already have math imported)
+def rotation_x(angle_deg):
+    """Rotation around first-camera X axis (= world Y, lateral tilt)."""
+    a = math.radians(angle_deg)
+    return np.array([[1,0,0],[0,math.cos(a),-math.sin(a)],[0,math.sin(a),math.cos(a)]])
+
+def rotation_y(angle_deg):
+    """Rotation around first-camera Y axis (= world Z, yaw/heading)."""
+    a = math.radians(angle_deg)
+    return np.array([[math.cos(a),0,math.sin(a)],[0,1,0],[-math.sin(a),0,math.cos(a)]])
+
+def rotation_z(angle_deg):
+    """Rotation around first-camera Z axis (= world X, roll)."""
+    a = math.radians(angle_deg)
+    return np.array([[math.cos(a),-math.sin(a),0],[math.sin(a),math.cos(a),0],[0,0,1]])
+
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+
+def load_frames_index(eval_dir: str) -> list[dict]:
+    csv_path = os.path.join(eval_dir, "frames_index.csv")
+    if not os.path.isfile(csv_path):
+        print(f"Error: frames_index.csv not found at {csv_path}")
+        print("Run viz_scripts/render_frames.py --save_frames first.")
+        sys.exit(1)
+
+    frames = []
+    with open(csv_path, "r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            floats = [float(v) for v in row["estimated_pose"].strip().split()]
+            frames.append({
+                "index": int(row["index"]),
+                "gt_rgb_path": os.path.join(eval_dir, row["gt_rgb_path"]),
+                "gt_depth_path": os.path.join(eval_dir, row["gt_depth_path"]),
+                "gs_rgb_path": os.path.join(eval_dir, row["gs_rgb_path"]),
+                "gs_depth_path": os.path.join(eval_dir, row["gs_depth_path"]),
+                "camera_pose": np.array(floats, dtype=np.float64).reshape(4, 4),
+            })
+    return frames
+
+
+def load_camera_info(eval_dir: str) -> dict:
+    path = os.path.join(eval_dir, "camera_info.json")
+    if not os.path.isfile(path):
+        print(f"Error: camera_info.json not found at {path}")
+        print("Run viz_scripts/render_frames.py --save_frames first.")
+        sys.exit(1)
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def get_frame(frames: list[dict], image_idx: int) -> dict | None:
+    for f in frames:
+        if f["index"] == image_idx:
+            return f
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 3DGS rendering
+# ---------------------------------------------------------------------------
+
+def load_checkpoint(experiment_dir: str) -> dict:
+    params_path = os.path.join(experiment_dir, "params.npz")
+    if not os.path.isfile(params_path):
+        print(f"Error: checkpoint not found at {params_path}")
+        sys.exit(1)
+    arr = dict(np.load(params_path, allow_pickle=True))
+    return {k: torch.tensor(v).cuda().float() for k, v in arr.items()}
+
+
+def render_frame(params: dict, frame_idx: int, camera_info: dict) -> np.ndarray:
+    """Render an RGB image from the 3DGS map at the given frame's estimated pose.
+
+    Returns HxWx3 uint8 BGR image.
+    """
+    h = camera_info["image_height"]
+    w = camera_info["image_width"]
+    k = np.array([
+        [camera_info["fx"], 0.0, camera_info["cx"]],
+        [0.0, camera_info["fy"], camera_info["cy"]],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float32)
+    identity_w2c = np.eye(4, dtype=np.float32)
+    cam = setup_camera(w, h, k, identity_w2c)
+
+    with torch.no_grad():
+        transformed_gaussians = transform_to_frame(
+            params, frame_idx, gaussians_grad=False, camera_grad=False,
+        )
+        rendervar = transformed_params2rendervar(params, transformed_gaussians)
+        im, _, _ = Renderer(raster_settings=cam)(**rendervar)
+
+    rgb = torch.clamp(im, 0, 1).detach().cpu().permute(1, 2, 0).numpy()
+    return cv2.cvtColor((rgb * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+
+
+def render_from_pose(params: dict, c2w: np.ndarray, camera_info: dict) -> np.ndarray:
+    """Render an RGB image from an arbitrary c2w pose (in first-camera frame).
+
+    Returns HxWx3 uint8 BGR image.
+    """
+    h = camera_info["image_height"]
+    w = camera_info["image_width"]
+    k = np.array([
+        [camera_info["fx"], 0.0, camera_info["cx"]],
+        [0.0, camera_info["fy"], camera_info["cy"]],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float32)
+    w2c = np.linalg.inv(c2w).astype(np.float32)
+    cam = setup_camera(w, h, k, w2c)
+
+    with torch.no_grad():
+        rendervar = params2rendervar(params)
+        im, _, _ = Renderer(raster_settings=cam)(**rendervar)
+
+    rgb = torch.clamp(im, 0, 1).detach().cpu().permute(1, 2, 0).numpy()
+    return cv2.cvtColor((rgb * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+
+
+# ---------------------------------------------------------------------------
+# VLM
+# ---------------------------------------------------------------------------
+
+def encode_image_b64(path: str) -> str:
+    with open(path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
 
-def build_prompt(rgb_path: str, depth_path: str | None = None) -> list:
-    prompt_text = (
-        "You are given observations from an indoor robot scene.\n\n"
-        "Input 1 (RGB): A perspective color image.\n"
-    )
-    if depth_path is not None:
-        prompt_text += (
-            "Input 2 (Depth): A depth visualization aligned with the RGB image. "
-            "Use it only as geometric context.\n"
-        )
-    prompt_text += (
-        "Use only evidence visible in the provided inputs.\n\n"
-        "TASK:\n"
-        f"{TASK_QUESTIONS}"
-    )
 
-    content = [
-        {
-            "type": "text",
-            "text": prompt_text,
-        },
-        {
-            "type": "image_url",
-            "image_url": {
-                "url": f"data:image/png;base64,{encode_image_b64(rgb_path)}",
-                "detail": "high",
-            },
-        },
-    ]
-
-    if depth_path is not None:
-        content.append(
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/png;base64,{encode_image_b64(depth_path)}",
-                    "detail": "high",
-                },
-            }
-        )
-
+def build_prompt(rgb_path: str) -> list[dict]:
     return [
         {
             "role": "user",
-            "content": content,
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "You are given an RGB image from an indoor robot scene.\n"
+                        "Use only evidence visible in the image.\n\n"
+                        f"TASK:\n{TASK_QUESTION}"
+                    ),
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{encode_image_b64(rgb_path)}",
+                        "detail": "high",
+                    },
+                },
+            ],
         }
     ]
 
-def call_vlm(messages: list, api_key: str, model: str = "gpt-4o", expect_json: bool = False) -> dict:
-    import httpx
 
-    def _strip_code_fences(text: str) -> str:
-        cleaned = text.strip()
-        if not cleaned.startswith("```"):
-            return cleaned
-
-        lines = cleaned.splitlines()
-        if lines and lines[0].strip().startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip().startswith("```"):
-            lines = lines[:-1]
-        cleaned = "\n".join(lines).strip()
-
-        # Handle accidental leading "json" token outside the code fence line.
-        if cleaned.lower().startswith("json"):
-            cleaned = cleaned[4:].lstrip("\n :")
-        return cleaned
-
-    def _parse_json_from_response(content: str) -> tuple[dict | list | None, str | None]:
-        cleaned = _strip_code_fences(content)
-
-        # Fast path: already valid JSON.
-        try:
-            return json.loads(cleaned), None
-        except json.JSONDecodeError:
-            pass
-
-        # Fallback: find the first valid JSON object/array embedded in prose.
-        decoder = json.JSONDecoder()
-        for i, ch in enumerate(cleaned):
-            if ch not in "[{":
-                continue
-            try:
-                parsed, _ = decoder.raw_decode(cleaned[i:])
-                return parsed, None
-            except json.JSONDecodeError:
-                continue
-
-        return None, "No valid JSON object/array found in model output"
-
+def call_vlm(messages: list, api_key: str, model: str) -> dict:
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
@@ -128,42 +237,24 @@ def call_vlm(messages: list, api_key: str, model: str = "gpt-4o", expect_json: b
         "messages": messages,
         "max_tokens": 1000,
         "temperature": 0.0,
+        "response_format": {"type": "json_object"},
     }
-    if expect_json:
-        payload["response_format"] = {"type": "json_object"}
 
     for attempt in range(3):
         try:
-            response = httpx.post(
+            resp = httpx.post(
                 "https://api.openai.com/v1/chat/completions",
                 headers=headers,
                 json=payload,
                 timeout=60.0,
             )
-            response.raise_for_status()
-            result = response.json()
-            content = result["choices"][0]["message"]["content"].strip()
-
-            parsed, parse_err = _parse_json_from_response(content)
-            if parse_err is None:
-                return parsed if isinstance(parsed, dict) else {"parsed_response": parsed}
-
-            # In general mode, plain text answers are valid and should not be treated as errors.
-            if not expect_json:
-                return {
-                    "text_response": content,
-                    "response_format": "plain_text",
-                }
-
-            raise json.JSONDecodeError(parse_err, content, 0)
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"].strip()
+            return json.loads(content)
         except (json.JSONDecodeError, KeyError) as e:
-            print(f"  Warning: JSON parse failed (attempt {attempt+1}): {e}")
+            print(f"  Warning: parse error (attempt {attempt+1}): {e}")
             if attempt == 2:
-                return {
-                    "raw_response": content,
-                    "raw_response_lines": content.splitlines(),
-                    "parse_error": str(e),
-                }
+                return {"raw_response": content, "parse_error": str(e)}
         except Exception as e:
             print(f"  Warning: API error (attempt {attempt+1}): {e}")
             if attempt < 2:
@@ -173,196 +264,130 @@ def call_vlm(messages: list, api_key: str, model: str = "gpt-4o", expect_json: b
 
     return {"error": "max retries exceeded"}
 
-def list_rgb_images(rgb_dir: str, image_glob: str):
-    pattern = os.path.join(rgb_dir, image_glob)
-    paths = sorted(glob(pattern))
-    return [p for p in paths if os.path.isfile(p)]
-
-def find_matching_depth(rgb_path: str, depth_dir: str) -> str | None:
-    depth_candidate = os.path.join(depth_dir, os.path.basename(rgb_path))
-    if os.path.exists(depth_candidate):
-        return depth_candidate
-    return None
-
-def select_images(image_paths: list[str], image_idx: str, max_images: int) -> list[str]:
-    if image_idx.strip() == "-1":
-        selected = image_paths
-    else:
-        selected = []
-        tokens = [t.strip() for t in image_idx.split(",") if t.strip()]
-        for tok in tokens:
-            if not tok.lstrip("-").isdigit():
-                print(f"Warning: ignoring invalid image_idx token '{tok}'")
-                continue
-            idx = int(tok)
-            if 0 <= idx < len(image_paths):
-                selected.append(image_paths[idx])
-                continue
-
-            found = None
-            target = f"_{idx:04d}.png"
-            for p in image_paths:
-                if p.endswith(target):
-                    found = p
-                    break
-            if found is not None:
-                selected.append(found)
-            else:
-                print(f"Warning: no image matched index '{tok}'")
-
-    if max_images > 0:
-        selected = selected[:max_images]
-
-    # Remove duplicates while preserving order.
-    deduped = []
-    seen = set()
-    for p in selected:
-        if p not in seen:
-            deduped.append(p)
-            seen.add(p)
-    return deduped
 
 
-def evaluate(
-    experiment_dir: str,
-    image_idx: str,
-    use_rendered: bool,
-    use_depth: bool,
-    expect_json: bool,
-    image_glob: str,
-    api_key: str,
-    model: str,
-    output_dir: str,
-    max_images: int,
-):
-    os.makedirs(output_dir, exist_ok=True)
 
-    eval_dir = os.path.join(experiment_dir, "eval")
-    rgb_dir = os.path.join(eval_dir, "rendered_rgb" if use_rendered else "rgb")
-    depth_dir = os.path.join(eval_dir, "depth_metric")
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
-    if not os.path.isdir(rgb_dir):
-        print(f"Error: RGB directory not found: {rgb_dir}")
-        sys.exit(1)
-
-    image_paths = list_rgb_images(rgb_dir, image_glob)
-    if not image_paths:
-        print(f"Error: No images found in {rgb_dir} matching glob '{image_glob}'")
-        sys.exit(1)
-
-    image_paths = select_images(image_paths, image_idx=image_idx, max_images=max_images)
-    if not image_paths:
-        print("Error: no images selected after applying --image_idx/--max_images")
-        sys.exit(1)
-
-    print("=" * 70)
-    print("VLM Evaluation")
-    print("=" * 70)
-    print(f"Experiment dir:     {experiment_dir}")
-    print(f"RGB dir:            {rgb_dir}")
-    print(f"Depth enabled:      {use_depth}")
-    if use_depth:
-        print(f"Depth dir:          {depth_dir}")
-        if not os.path.isdir(depth_dir):
-            print("Warning: depth directory not found, prompts will use only RGB")
-    print(f"Image glob:         {image_glob}")
-    print(f"Images to evaluate: {len(image_paths)}")
-    print(f"Model:              {model}")
-    print(f"Expect JSON:        {expect_json}")
-    print()
-
-    aggregate = {
-        "experiment_dir": experiment_dir,
-        "rgb_dir": rgb_dir,
-        "depth_dir": depth_dir if use_depth else None,
-        "use_rendered": use_rendered,
-        "use_depth": use_depth,
-        "expect_json": expect_json,
-        "image_idx": image_idx,
-        "image_glob": image_glob,
-        "model": model,
-        "num_images": len(image_paths),
-        "results": [],
-    }
-
-    for idx, image_path in enumerate(image_paths):
-        image_name = os.path.basename(image_path)
-        print(f"[{idx+1}/{len(image_paths)}] Evaluating {image_name}")
-
-        depth_path = None
-        if use_depth and os.path.isdir(depth_dir):
-            depth_path = find_matching_depth(image_path, depth_dir)
-            if depth_path is None:
-                print(f"  Warning: matching depth not found for {image_name}, using RGB only")
-
-        messages = build_prompt(image_path, depth_path=depth_path)
-        response = call_vlm(messages, api_key=api_key, model=model, expect_json=expect_json)
-
-        entry = {
-            "image_path": image_path,
-            "depth_path": depth_path,
-            "response": response,
-        }
-        aggregate["results"].append(entry)
-
-        per_image_path = os.path.join(output_dir, f"{os.path.splitext(image_name)[0]}.json")
-        with open(per_image_path, "w") as f:
-            json.dump(entry, f, indent=2)
-
-        if isinstance(response, dict) and "parse_error" in response and "raw_response" in response:
-            raw_text_path = os.path.join(output_dir, f"{os.path.splitext(image_name)[0]}_raw_response.txt")
-            with open(raw_text_path, "w") as f:
-                f.write(response["raw_response"])
-
-        print(f"  Saved: {per_image_path}")
-
-    aggregate_path = os.path.join(output_dir, "vlm_evaluation_summary.json")
-    with open(aggregate_path, "w") as f:
-        json.dump(aggregate, f, indent=2)
-
-    print()
-    print("=" * 70)
-    print("DONE")
-    print("=" * 70)
-    print(f"Per-image results in: {output_dir}")
-    print(f"Aggregate summary: {aggregate_path}")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Run VLM baseline prompt (Condition A) on experiment RGB/depth images"
-    )
-    parser.add_argument("--experiment_dir", type=str, required=True, help="Directory of the experiment")
-    parser.add_argument("--image_idx", type=str, default="-1", help="Image index (by sorted order) or frame id; use '-1' for all")
-    parser.add_argument("--max_images", type=int, default=-1, help="Maximum number of images to evaluate (-1 for all)")
-    parser.add_argument("--use_rendered", action=argparse.BooleanOptionalAction, default=False, help="Use rendered images from eval/rendered_* instead of eval/*")
-    parser.add_argument("--use_depth", action=argparse.BooleanOptionalAction, default=False, help="Include depth image in the prompt")
-    parser.add_argument("--expect_json", action=argparse.BooleanOptionalAction, default=False, help="Require JSON output from model")
-    parser.add_argument("--image_glob", type=str, default="*.png", help="Glob for images inside selected RGB directory")
-    parser.add_argument("--model", type=str, default="gpt-4o", help="Model name (gpt-4o, gpt-4o-mini)")
-    parser.add_argument("--output_dir", type=str, default=None, help="Output directory for json results")
-    parser.add_argument("--api_key", type=str, default=None, help="OpenAI API key (or set OPENAI_API_KEY env var)")
+def main():
+    parser = argparse.ArgumentParser(description="Minimal VLM evaluation on RGB images")
+    parser.add_argument("--experiment_dir", type=str, required=True)
+    parser.add_argument("--image_idx", type=int, required=True, help="Frame index to evaluate")
+    parser.add_argument("--use_rendered", action="store_true", help="Use rendered RGB instead of GT")
+    parser.add_argument("--model", type=str, default="gpt-4o")
+    parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument("--api_key", type=str, default=None)
     args = parser.parse_args()
 
     api_key = args.api_key or os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        print("Error: Provide --api_key or set OPENAI_API_KEY environment variable")
+        print("Error: provide --api_key or set OPENAI_API_KEY")
         sys.exit(1)
 
-    output_dir = args.output_dir
-    if output_dir is None:
-        output_dir = os.path.join(args.experiment_dir, "vlm_evaluation_results")
-        output_dir = os.path.normpath(output_dir)
+    eval_dir = os.path.join(args.experiment_dir, "eval")
+    frames = load_frames_index(eval_dir)
+    camera_info = load_camera_info(eval_dir)
 
-    evaluate(
-        experiment_dir=args.experiment_dir,
-        image_idx=args.image_idx,
-        use_rendered=args.use_rendered,
-        use_depth=args.use_depth,
-        expect_json=args.expect_json,
-        image_glob=args.image_glob,
-        max_images=args.max_images,
-        model=args.model,
-        output_dir=output_dir,
-        api_key=api_key,
-    )
+    frame = get_frame(frames, args.image_idx)
+    if frame is None:
+        print(f"Error: frame {args.image_idx} not found in frames_index.csv")
+        sys.exit(1)
+
+    output_dir = args.output_dir or os.path.join(args.experiment_dir, str(args.image_idx))
+    os.makedirs(output_dir, exist_ok=True)
+
+    render_dir = os.path.join(output_dir, "novel_view")
+    os.makedirs(render_dir, exist_ok=True)
+
+    # Load 3DGS checkpoint and render from the frame's pose
+    print(f"Loading 3DGS checkpoint...")
+    params = load_checkpoint(args.experiment_dir)
+
+    idx = frame["index"]
+    c2w = frame["camera_pose"]
+    tx, ty, tz = c2w_to_translation(c2w)
+    roll, pitch, yaw = c2w_to_rpy_deg(c2w)
+    rgb_path = frame["gs_rgb_path"] if args.use_rendered else frame["gt_rgb_path"]
+
+    print(f"Experiment:  {args.experiment_dir}")
+    print(f"Frame:       {idx}")
+    print(f"Source:      {'rendered' if args.use_rendered else 'ground truth'} RGB")
+    print(f"Model:       {args.model}")
+    print(f"Pose (c2w):  t=[{tx:.3f}, {ty:.3f}, {tz:.3f}]  rpy=[{roll:.1f}, {pitch:.1f}, {yaw:.1f}] deg")
+    print()
+
+    # Render from this frame's pose using the 3DGS map
+    rendered_path = os.path.join(render_dir, f"rendered_{idx:04d}.png")
+    rendered_img = render_frame(params, idx, camera_info)
+    cv2.imwrite(rendered_path, rendered_img)
+    print(f"Rendered: {rendered_path}")
+
+    # Render novel view: +1m on world Z axis (= +1m on first-camera-frame Y axis)
+    novel_c2w = c2w.copy()
+    
+    # Translation offsets (applied in world frame)
+    # negative X -> forward, positive X -> backward (in first-camera frame, X is right = world Y)
+    # negative Y -> up, positive Y -> down (in first-camera frame, Y is up = world Z)
+    # negative Z -> left, positive Z -> right (in first-camera frame, Z is forward = world X)
+    novel_c2w[0, 3] += 0.0  # first-camera X axis = world Y (right)
+    novel_c2w[1, 3] += 0.0  # first-camera Y axis = world Z (up)
+    novel_c2w[2, 3] += 0.0  # first-camera Z axis = world X (forward)
+    
+    # Rotation offsets (applied in camera's local frame)
+    # Positive rotation around first-camera X axis tilts up, negative tilts down
+    # Positive rotation around first-camera Y axis pans right, negative pans left
+    # Positive rotation around first-camera Z axis rolls clockwise, negative rolls counterclockwise
+    novel_c2w[:3, :3] = novel_c2w[:3, :3] @ rotation_x(0.0)  # tilt up/down
+    novel_c2w[:3, :3] = novel_c2w[:3, :3] @ rotation_y(0.0)  # pan left/right
+    novel_c2w[:3, :3] = novel_c2w[:3, :3] @ rotation_z(0.0) # roll
+    
+    novel_tx, novel_ty, novel_tz = c2w_to_translation(novel_c2w)
+    novel_roll, novel_pitch, novel_yaw = c2w_to_rpy_deg(novel_c2w)
+
+    novel_path = os.path.join(render_dir, f"novel_{idx:04d}_z+1m.png")
+    novel_img = render_from_pose(params, novel_c2w, camera_info)
+    cv2.imwrite(novel_path, novel_img)
+    print(f"Novel view (+1m Z): {novel_path}")
+    print(f"  Pose (c2w): t=[{novel_tx:.3f}, {novel_ty:.3f}, {novel_tz:.3f}]  rpy=[{novel_roll:.1f}, {novel_pitch:.1f}, {novel_yaw:.1f}] deg")
+
+    # Query VLM
+    messages = build_prompt(rgb_path)
+    response = call_vlm(messages, api_key=api_key, model=args.model)
+    print(f"Response: {json.dumps(response, indent=2)}")
+
+    # Save result
+    output = {
+        "experiment_dir": args.experiment_dir,
+        "frame_index": idx,
+        "use_rendered": args.use_rendered,
+        "model": args.model,
+        "task_question": TASK_QUESTION.strip(),
+        "camera_info": camera_info,
+        "rgb_path": rgb_path,
+        "rendered_path": rendered_path,
+        "gt_depth_path": frame["gt_depth_path"],
+        "gs_depth_path": frame["gs_depth_path"],
+        "camera_pose_c2w": c2w.tolist(),
+        "translation": [tx, ty, tz],
+        "rotation_rpy_deg": [roll, pitch, yaw],
+        "novel_view": {
+            "path": novel_path,
+            "camera_pose_c2w": novel_c2w.tolist(),
+            "translation": [novel_tx, novel_ty, novel_tz],
+            "rotation_rpy_deg": [novel_roll, novel_pitch, novel_yaw],
+            "offset_world_z_m": 1.0,
+        },
+        "response": response,
+    }
+
+    out_path = os.path.join(output_dir, "vlm_evaluation.json")
+    with open(out_path, "w") as f:
+        json.dump(output, f, indent=2)
+
+    print(f"\nResults saved to: {out_path}")
+
+
+if __name__ == "__main__":
+    main()

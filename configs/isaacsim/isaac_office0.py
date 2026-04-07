@@ -49,7 +49,7 @@ config = dict(
         desired_image_width=1200,
         start=0,
         end=-1,
-        stride=3,
+        stride=1,
         num_frames=-1,
     ),
     tracking=dict(
