@@ -9,6 +9,22 @@ Usage:
   python scripts/vlm_evaluation_general.py \
     --experiment_dir ./experiments/IsaacSim/office0_0 \
     --image_idx 42 --model gpt-4o [--use_rendered]
+
+# Translation offsets (applied in world frame)
+# negative X -> forward, positive X -> backward (in first-camera frame, X is right = world Y)
+# negative Y -> up, positive Y -> down (in first-camera frame, Y is up = world Z)
+# negative Z -> left, positive Z -> right (in first-camera frame, Z is forward = world X)
+novel_c2w[0, 3] += 0.0  # first-camera X axis = world Y (right)
+novel_c2w[1, 3] += 0.0  # first-camera Y axis = world Z (up)
+novel_c2w[2, 3] += 0.0  # first-camera Z axis = world X (forward)
+
+# Rotation offsets (applied in camera's local frame)
+# Positive rotation around first-camera X axis tilts up, negative tilts down
+# Positive rotation around first-camera Y axis pans right, negative pans left
+# Positive rotation around first-camera Z axis rolls clockwise, negative rolls counterclockwise
+novel_c2w[:3, :3] = novel_c2w[:3, :3] @ rotation_x(0.0)  # tilt up/down
+novel_c2w[:3, :3] = novel_c2w[:3, :3] @ rotation_y(0.0)  # pan left/right
+novel_c2w[:3, :3] = novel_c2w[:3, :3] @ rotation_z(0.0) # roll
 """
 import argparse
 import base64
@@ -31,21 +47,130 @@ from diff_gaussian_rasterization import GaussianRasterizer as Renderer
 from utils.recon_helpers import setup_camera
 from utils.slam_helpers import (
     params2rendervar,
+    params2depthplussilhouette,
     transform_to_frame,
     transformed_params2rendervar,
+    transformed_params2depthplussilhouette,
 )
 
 
-TASK_QUESTION = """
-Determine the spatial relationship between the computer monitor and the cardboard box.
+OBJECT_1 = "Computer monitor"
+OBJECT_2 = "Orange frame picture on one of the desks"
+MAX_DETECTION_ROUNDS = 10
+MAX_SPATIAL_ROUNDS = 5
+USE_ONLY_ROTATIONS_IN_DETECTION_LOOP = True
+
+if USE_ONLY_ROTATIONS_IN_DETECTION_LOOP:
+    _DETECTION_MOVEMENTS = """Available camera movements to look around:
+  Rotation (15 deg step): "tilt_up", "tilt_down", "pan_left", "pan_right"
+
+IMPORTANT: You can ONLY use rotations during detection. Do NOT request any translation — "requested_translation" must always be ""."""
+    _DETECTION_STRATEGY = """Exploration strategy:
+  1. Scan by rotating in BOTH directions (pan_left AND pan_right, tilt_up AND tilt_down) from the initial pose.
+  2. If one direction does not work, use "from_initial": true to reset and try a different rotation direction.
+  3. Never keep rotating in the same direction more than 2-3 times — if it did not work, try the opposite direction."""
+    _DETECTION_TRANSLATION_SCHEMA = '    "requested_translation": "",'
+else:
+    _DETECTION_MOVEMENTS = """Available camera movements to look around:
+  Translation (0.15 m step): "up", "down", "left", "right", "forward", "backward"
+  Rotation (15 deg step):    "tilt_up", "tilt_down", "pan_left", "pan_right" """
+    _DETECTION_STRATEGY = """Exploration strategy:
+  1. First scan by rotating in BOTH directions (pan_left AND pan_right, tilt_up AND tilt_down) from the initial pose.
+  2. If rotations alone do not reveal the object, use "from_initial": true to reset to the starting pose and then translate to a new position.
+  3. Never keep panning in the same direction more than 2-3 times — if it did not work, try the opposite direction or a translation."""
+    _DETECTION_TRANSLATION_SCHEMA = '    "requested_translation": "" | "up" | "down" | "left" | "right" | "forward" | "backward",'
+
+DETECTION_PROMPT = f"""
+Look at this image from an indoor robot scene. Do you see both of these objects?
+1. {OBJECT_1}
+2. {OBJECT_2}
+
+{_DETECTION_MOVEMENTS}
+
+You have a maximum of {MAX_DETECTION_ROUNDS} attempts to find both objects, so be strategic. Do NOT repeat the same movement — vary your exploration.
+
+{_DETECTION_STRATEGY}
+
+IMPORTANT — "from_initial" field:
+  - "from_initial": false → the requested movement is applied ON TOP of the current camera pose (incremental).
+  - "from_initial": true  → the camera is RESET to the starting pose BEFORE applying the requested movement. Use this when you have already rotated or moved far from the start and want to try a completely different direction.
+
+IMPORTANT — You will be told what movements you already tried. Do NOT repeat a movement that already failed. Try something different.
+
+{{HISTORY}}
 
 Return only valid JSON (no markdown, no extra text) with exactly this schema:
-{
-    "spatial_relationship": "in front of" | "behind" | "to the left of" | "to the right of" | "above" | "below" | "uncertain",
-    "confidence": float (0.0 to 1.0),
-    "reasoning": string
-}
+{{
+    "object_1_visible": boolean,
+    "object_2_visible": boolean,
+    "both_visible": boolean,
+    "reasoning": string,
+    "request_new_view": boolean,
+    "from_initial": boolean,
+{_DETECTION_TRANSLATION_SCHEMA}
+    "requested_rotation": "" | "tilt_up" | "tilt_down" | "pan_left" | "pan_right",
+    "new_view_reasoning": string
+}}
 """
+
+SPATIAL_PROMPT = f"""
+You can see both objects in this image:
+1. {OBJECT_1}
+2. {OBJECT_2}
+
+Determine the spatial relationship of the first object relative to the second object along all three axes:
+  - left/right (lateral)
+  - in front of/behind (depth)
+  - above/below (vertical)
+
+If you are confident, return your answer. If the relationship is uncertain or ambiguous from this viewpoint, you may request a new camera view to disambiguate.
+
+Available camera movements (you can combine one translation and one rotation):
+  Translation (0.15 m step): "up", "down", "left", "right", "forward", "backward"
+  Rotation (15 deg step):    "tilt_up", "tilt_down", "pan_left", "pan_right"
+
+You have a maximum of {MAX_SPATIAL_ROUNDS} attempts to determine the spatial relationship.
+
+IMPORTANT — "from_initial" field:
+  - "from_initial": false → the requested movement is applied ON TOP of the current camera pose (incremental).
+  - "from_initial": true  → the camera is RESET to the starting pose BEFORE applying the requested movement. Use this when the current viewpoint has drifted too far and you want to try a different angle from the original position.
+
+{{HISTORY}}
+
+Return only valid JSON (no markdown, no extra text) with exactly this schema:
+{{
+    "lateral": "to the left of" | "to the right of" | "aligned" | "uncertain",
+    "depth": "in front of" | "behind" | "aligned" | "uncertain",
+    "vertical": "above" | "below" | "aligned" | "uncertain",
+    "confidence": float (0.0 to 1.0),
+    "reasoning": string,
+    "request_new_view": boolean,
+    "from_initial": boolean,
+    "requested_translation": "" | "up" | "down" | "left" | "right" | "forward" | "backward",
+    "requested_rotation": "" | "tilt_up" | "tilt_down" | "pan_left" | "pan_right",
+    "new_view_reasoning": string
+}}
+"""
+
+TRANSLATION_STEP_M = 0.15
+ROTATION_STEP_DEG = 15.0
+
+# Maps VLM action strings to c2w offsets in first-camera frame
+TRANSLATION_MAP = {
+    "up":       (0.0, -TRANSLATION_STEP_M, 0.0),   # -Y = world up
+    "down":     (0.0, +TRANSLATION_STEP_M, 0.0),   # +Y = world down
+    "left":     (-TRANSLATION_STEP_M, 0.0, 0.0),   # -X = world left
+    "right":    (+TRANSLATION_STEP_M, 0.0, 0.0),   # +X = world right
+    "forward":  (0.0, 0.0, +TRANSLATION_STEP_M),   # +Z = world forward
+    "backward": (0.0, 0.0, -TRANSLATION_STEP_M),   # -Z = world backward
+}
+
+ROTATION_MAP = {
+    "tilt_up":   ("x", +ROTATION_STEP_DEG),
+    "tilt_down": ("x", -ROTATION_STEP_DEG),
+    "pan_left":  ("y", -ROTATION_STEP_DEG),
+    "pan_right": ("y", +ROTATION_STEP_DEG),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +211,58 @@ def rotation_z(angle_deg):
     """Rotation around first-camera Z axis (= world X, roll)."""
     a = math.radians(angle_deg)
     return np.array([[math.cos(a),-math.sin(a),0],[math.sin(a),math.cos(a),0],[0,0,1]])
+
+def build_history_string(rounds_list: list[dict], phase: str = "detection") -> str:
+    """Build a summary of previous rounds for the VLM to avoid repeating moves."""
+    if not rounds_list:
+        return ""
+    lines = ["Previous attempts (do NOT repeat these):"]
+    for r in rounds_list:
+        resp = r.get("response", {})
+        if not isinstance(resp, dict):
+            continue
+        rnd = r["round"]
+        trans = resp.get("requested_translation", "")
+        rot = resp.get("requested_rotation", "")
+        from_init = resp.get("from_initial", False)
+        move = []
+        if trans:
+            move.append(f"translate={trans}")
+        if rot:
+            move.append(f"rotate={rot}")
+        move_str = ", ".join(move) if move else "none"
+        base = "from_initial" if from_init else "incremental"
+        if phase == "detection":
+            obj1 = "visible" if resp.get("object_1_visible") else "not visible"
+            obj2 = "visible" if resp.get("object_2_visible") else "not visible"
+            lines.append(f"  Round {rnd}: {move_str} ({base}) → obj1={obj1}, obj2={obj2}")
+        else:
+            conf = resp.get("confidence", "?")
+            lines.append(f"  Round {rnd}: {move_str} ({base}) → confidence={conf}")
+    return "\n".join(lines)
+
+
+def apply_view_request(c2w: np.ndarray, translation: str, rotation: str) -> np.ndarray:
+    """Apply a VLM-requested camera movement to a c2w pose."""
+    new_c2w = c2w.copy()
+
+    if translation in TRANSLATION_MAP:
+        dx, dy, dz = TRANSLATION_MAP[translation]
+        new_c2w[0, 3] += dx
+        new_c2w[1, 3] += dy
+        new_c2w[2, 3] += dz
+
+    if rotation in ROTATION_MAP:
+        axis, angle = ROTATION_MAP[rotation]
+        if axis == "x":
+            new_c2w[:3, :3] = new_c2w[:3, :3] @ rotation_x(angle)
+        elif axis == "y":
+            new_c2w[:3, :3] = new_c2w[:3, :3] @ rotation_y(angle)
+        elif axis == "z":
+            new_c2w[:3, :3] = new_c2w[:3, :3] @ rotation_z(angle)
+
+    return new_c2w
+
 
 # ---------------------------------------------------------------------------
 # Data loading
@@ -170,10 +347,12 @@ def render_frame(params: dict, frame_idx: int, camera_info: dict) -> np.ndarray:
     return cv2.cvtColor((rgb * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
 
 
-def render_from_pose(params: dict, c2w: np.ndarray, camera_info: dict) -> np.ndarray:
-    """Render an RGB image from an arbitrary c2w pose (in first-camera frame).
+def render_from_pose(params: dict, c2w: np.ndarray, camera_info: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Render RGB and depth from an arbitrary c2w pose (in first-camera frame).
 
-    Returns HxWx3 uint8 BGR image.
+    Returns:
+        rgb_bgr: HxWx3 uint8 BGR image.
+        depth: HxW float32 metric depth in meters.
     """
     h = camera_info["image_height"]
     w = camera_info["image_width"]
@@ -183,14 +362,25 @@ def render_from_pose(params: dict, c2w: np.ndarray, camera_info: dict) -> np.nda
         [0.0, 0.0, 1.0],
     ], dtype=np.float32)
     w2c = np.linalg.inv(c2w).astype(np.float32)
+    w2c_torch = torch.tensor(w2c).cuda().float()
     cam = setup_camera(w, h, k, w2c)
 
     with torch.no_grad():
         rendervar = params2rendervar(params)
         im, _, _ = Renderer(raster_settings=cam)(**rendervar)
 
+        depth_rendervar = params2depthplussilhouette(params, w2c_torch)
+        depth_sil, _, _ = Renderer(raster_settings=cam)(**depth_rendervar)
+        depth = depth_sil[0].detach().cpu().numpy().astype(np.float32)
+
     rgb = torch.clamp(im, 0, 1).detach().cpu().permute(1, 2, 0).numpy()
-    return cv2.cvtColor((rgb * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+    return cv2.cvtColor((rgb * 255).astype(np.uint8), cv2.COLOR_RGB2BGR), depth
+
+
+def depth_to_colormap(depth: np.ndarray, vmin: float = 0.0, vmax: float = 6.0) -> np.ndarray:
+    """Convert metric depth to a JET colormap BGR image for VLM input."""
+    normalized = np.clip((depth - vmin) / (vmax - vmin), 0, 1)
+    return cv2.applyColorMap((normalized * 255).astype(np.uint8), cv2.COLORMAP_JET)
 
 
 # ---------------------------------------------------------------------------
@@ -202,29 +392,33 @@ def encode_image_b64(path: str) -> str:
         return base64.b64encode(f.read()).decode("utf-8")
 
 
-def build_prompt(rgb_path: str) -> list[dict]:
-    return [
+def build_prompt(rgb_path: str, task_prompt: str, depth_path: str | None = None) -> list[dict]:
+    text = "You are given an RGB image from an indoor robot scene.\n"
+    if depth_path is not None:
+        text += "You are also given a depth map (colorized, blue=near, red=far) aligned with the RGB image. Use it as geometric context.\n"
+    text += f"Use only evidence visible in the provided inputs.\n\nTASK:\n{task_prompt}"
+
+    content = [
+        {"type": "text", "text": text},
         {
-            "role": "user",
-            "content": [
-                {
-                    "type": "text",
-                    "text": (
-                        "You are given an RGB image from an indoor robot scene.\n"
-                        "Use only evidence visible in the image.\n\n"
-                        f"TASK:\n{TASK_QUESTION}"
-                    ),
-                },
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/png;base64,{encode_image_b64(rgb_path)}",
-                        "detail": "high",
-                    },
-                },
-            ],
-        }
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/png;base64,{encode_image_b64(rgb_path)}",
+                "detail": "high",
+            },
+        },
     ]
+
+    if depth_path is not None:
+        content.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/png;base64,{encode_image_b64(depth_path)}",
+                "detail": "high",
+            },
+        })
+
+    return [{"role": "user", "content": content}]
 
 
 def call_vlm(messages: list, api_key: str, model: str) -> dict:
@@ -276,6 +470,7 @@ def main():
     parser.add_argument("--experiment_dir", type=str, required=True)
     parser.add_argument("--image_idx", type=int, required=True, help="Frame index to evaluate")
     parser.add_argument("--use_rendered", action="store_true", help="Use rendered RGB instead of GT")
+    parser.add_argument("--use_depth", action="store_true", help="Include depth map in VLM prompt")
     parser.add_argument("--model", type=str, default="gpt-4o")
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--api_key", type=str, default=None)
@@ -311,82 +506,267 @@ def main():
     roll, pitch, yaw = c2w_to_rpy_deg(c2w)
     rgb_path = frame["gs_rgb_path"] if args.use_rendered else frame["gt_rgb_path"]
 
-    print(f"Experiment:  {args.experiment_dir}")
-    print(f"Frame:       {idx}")
-    print(f"Source:      {'rendered' if args.use_rendered else 'ground truth'} RGB")
-    print(f"Model:       {args.model}")
-    print(f"Pose (c2w):  t=[{tx:.3f}, {ty:.3f}, {tz:.3f}]  rpy=[{roll:.1f}, {pitch:.1f}, {yaw:.1f}] deg")
-    print()
+    print(f"{'='*70}")
+    print(f"  VLM Spatial Evaluation")
+    print(f"{'='*70}")
+    print(f"  Experiment:    {args.experiment_dir}")
+    print(f"  Frame:         {idx}")
+    print(f"  Source:        {'rendered' if args.use_rendered else 'ground truth'} RGB")
+    print(f"  Depth:         {'enabled' if args.use_depth else 'disabled'}")
+    print(f"  Model:         {args.model}")
+    print(f"  Objects:       1. {OBJECT_1}")
+    print(f"                 2. {OBJECT_2}")
+    print(f"  Initial pose:  t=[{tx:.3f}, {ty:.3f}, {tz:.3f}]  rpy=[{roll:.1f}, {pitch:.1f}, {yaw:.1f}] deg")
+    print(f"  Max detection: {MAX_DETECTION_ROUNDS} rounds")
+    print(f"  Max spatial:   {MAX_SPATIAL_ROUNDS} rounds")
+    print(f"{'='*70}")
 
-    # Render from this frame's pose using the 3DGS map
+    # Helper to render and get depth for a given pose
+    def render_and_get_paths(pose, tag):
+        rgb_file = os.path.join(render_dir, f"{tag}.png")
+        rgb_img, depth_arr = render_from_pose(params, pose, camera_info)
+        cv2.imwrite(rgb_file, rgb_img)
+        depth_file = None
+        if args.use_depth:
+            depth_file = os.path.join(render_dir, f"{tag}_depth.png")
+            cv2.imwrite(depth_file, depth_to_colormap(depth_arr))
+        return rgb_file, depth_file
+
+    def print_pose(c2w_mat, indent="  "):
+        ptx, pty, ptz = c2w_to_translation(c2w_mat)
+        pr, pp, py_ = c2w_to_rpy_deg(c2w_mat)
+        print(f"{indent}Pose: t=[{ptx:.3f}, {pty:.3f}, {ptz:.3f}]  rpy=[{pr:.1f}, {pp:.1f}, {py_:.1f}] deg")
+
+    def print_vlm_response(resp, indent="  "):
+        for line in json.dumps(resp, indent=2).splitlines():
+            print(f"{indent}{line}")
+
+    # Resolve initial image and depth
     rendered_path = os.path.join(render_dir, f"rendered_{idx:04d}.png")
     rendered_img = render_frame(params, idx, camera_info)
     cv2.imwrite(rendered_path, rendered_img)
-    print(f"Rendered: {rendered_path}")
 
-    # Render novel view: +1m on world Z axis (= +1m on first-camera-frame Y axis)
-    novel_c2w = c2w.copy()
-    
-    # Translation offsets (applied in world frame)
-    # negative X -> forward, positive X -> backward (in first-camera frame, X is right = world Y)
-    # negative Y -> up, positive Y -> down (in first-camera frame, Y is up = world Z)
-    # negative Z -> left, positive Z -> right (in first-camera frame, Z is forward = world X)
-    novel_c2w[0, 3] += 0.0  # first-camera X axis = world Y (right)
-    novel_c2w[1, 3] += 0.0  # first-camera Y axis = world Z (up)
-    novel_c2w[2, 3] += 0.0  # first-camera Z axis = world X (forward)
-    
-    # Rotation offsets (applied in camera's local frame)
-    # Positive rotation around first-camera X axis tilts up, negative tilts down
-    # Positive rotation around first-camera Y axis pans right, negative pans left
-    # Positive rotation around first-camera Z axis rolls clockwise, negative rolls counterclockwise
-    novel_c2w[:3, :3] = novel_c2w[:3, :3] @ rotation_x(0.0)  # tilt up/down
-    novel_c2w[:3, :3] = novel_c2w[:3, :3] @ rotation_y(0.0)  # pan left/right
-    novel_c2w[:3, :3] = novel_c2w[:3, :3] @ rotation_z(0.0) # roll
-    
-    novel_tx, novel_ty, novel_tz = c2w_to_translation(novel_c2w)
-    novel_roll, novel_pitch, novel_yaw = c2w_to_rpy_deg(novel_c2w)
+    initial_depth_path = None
+    if args.use_depth:
+        initial_depth = frame["gs_depth_path"] if args.use_rendered else frame["gt_depth_path"]
+        if os.path.isfile(initial_depth):
+            initial_depth_path = initial_depth
+        else:
+            print(f"  Warning: depth not found: {initial_depth}, proceeding without")
 
-    novel_path = os.path.join(render_dir, f"novel_{idx:04d}_z+1m.png")
-    novel_img = render_from_pose(params, novel_c2w, camera_info)
-    cv2.imwrite(novel_path, novel_img)
-    print(f"Novel view (+1m Z): {novel_path}")
-    print(f"  Pose (c2w): t=[{novel_tx:.3f}, {novel_ty:.3f}, {novel_tz:.3f}]  rpy=[{novel_roll:.1f}, {novel_pitch:.1f}, {novel_yaw:.1f}] deg")
+    # ===================================================================
+    # Phase 1: Object Detection
+    # ===================================================================
+    print(f"\n{'='*70}")
+    print(f"  PHASE 1: OBJECT DETECTION")
+    print(f"{'='*70}")
 
-    # Query VLM
-    messages = build_prompt(rgb_path)
-    response = call_vlm(messages, api_key=api_key, model=args.model)
-    print(f"Response: {json.dumps(response, indent=2)}")
+    detection_rounds = []
+    current_c2w = c2w.copy()
+    current_rgb = rgb_path
+    current_depth = initial_depth_path
+    both_visible = False
+
+    for det_round in range(1, MAX_DETECTION_ROUNDS + 1):
+        print(f"\n  {'─'*50}")
+        print(f"  Detection Round {det_round}/{MAX_DETECTION_ROUNDS}")
+        print(f"  {'─'*50}")
+        print_pose(current_c2w, indent="    ")
+        print(f"    Image: {current_rgb}")
+        if current_depth:
+            print(f"    Depth: {current_depth}")
+
+        history = build_history_string(detection_rounds, phase="detection")
+        prompt = DETECTION_PROMPT.replace("{HISTORY}", history)
+        messages = build_prompt(current_rgb, prompt, depth_path=current_depth)
+        response = call_vlm(messages, api_key=api_key, model=args.model)
+
+        print(f"    VLM Response:")
+        print_vlm_response(response, indent="      ")
+
+        rtx, rty, rtz = c2w_to_translation(current_c2w)
+        rroll, rpitch, ryaw = c2w_to_rpy_deg(current_c2w)
+        detection_rounds.append({
+            "round": det_round,
+            "rgb_path": current_rgb,
+            "depth_path": current_depth,
+            "camera_pose_c2w": current_c2w.tolist(),
+            "translation": [rtx, rty, rtz],
+            "rotation_rpy_deg": [rroll, rpitch, ryaw],
+            "response": response,
+        })
+
+        if not isinstance(response, dict):
+            print(f"    Result: Invalid response, stopping.")
+            break
+
+        obj1 = response.get("object_1_visible", False)
+        obj2 = response.get("object_2_visible", False)
+        both_visible = response.get("both_visible", False)
+        print(f"    Visibility: obj1={'YES' if obj1 else 'NO'}  obj2={'YES' if obj2 else 'NO'}")
+
+        if both_visible:
+            print(f"    >> Both objects detected! Moving to Phase 2.")
+            break
+
+        if not response.get("request_new_view", False):
+            print(f"    >> VLM did not request a new view, stopping.")
+            break
+
+        req_trans = response.get("requested_translation", "").strip()
+        req_rot = response.get("requested_rotation", "").strip()
+        if USE_ONLY_ROTATIONS_IN_DETECTION_LOOP and req_trans:
+            print(f"    >> Ignoring translation '{req_trans}' (rotations only in detection)")
+            req_trans = ""
+        if not req_trans and not req_rot:
+            print(f"    >> No movement specified, stopping.")
+            break
+
+        from_initial = response.get("from_initial", False)
+        base_label = "initial" if from_initial else "current"
+        print(f"    >> Requesting new view (from {base_label}): translate=[{req_trans or 'none'}] rotate=[{req_rot or 'none'}]")
+
+        base_c2w = c2w.copy() if from_initial else current_c2w
+        current_c2w = apply_view_request(base_c2w, req_trans, req_rot)
+        current_rgb, current_depth = render_and_get_paths(
+            current_c2w, f"detect_{idx:04d}_round{det_round + 1}")
+
+    if not both_visible:
+        obj1_vis = response.get("object_1_visible", False) if isinstance(response, dict) else False
+        obj2_vis = response.get("object_2_visible", False) if isinstance(response, dict) else False
+        missing = []
+        if not obj1_vis:
+            missing.append(OBJECT_1)
+        if not obj2_vis:
+            missing.append(OBJECT_2)
+
+        print(f"\n  {'='*50}")
+        print(f"  RESULT: DETECTION FAILED")
+        print(f"  Rounds used: {len(detection_rounds)}/{MAX_DETECTION_ROUNDS}")
+        print(f"  Missing: {', '.join(missing)}")
+        print(f"  {'='*50}")
+
+        output = {
+            "experiment_dir": args.experiment_dir,
+            "frame_index": idx,
+            "use_rendered": args.use_rendered,
+            "use_depth": args.use_depth,
+            "model": args.model,
+            "object_1": OBJECT_1,
+            "object_2": OBJECT_2,
+            "status": "detection_failed",
+            "missing_objects": missing,
+            "camera_info": camera_info,
+            "detection_rounds": detection_rounds,
+        }
+
+        out_path = os.path.join(output_dir, "vlm_evaluation.json")
+        with open(out_path, "w") as f:
+            json.dump(output, f, indent=2)
+        print(f"\n  Results saved to: {out_path}")
+        return
+
+    # ===================================================================
+    # Phase 2: Spatial Relationship
+    # ===================================================================
+    print(f"\n{'='*70}")
+    print(f"  PHASE 2: SPATIAL RELATIONSHIP")
+    print(f"{'='*70}")
+
+    spatial_rounds = []
+    for sp_round in range(1, MAX_SPATIAL_ROUNDS + 1):
+        print(f"\n  {'─'*50}")
+        print(f"  Spatial Round {sp_round}/{MAX_SPATIAL_ROUNDS}")
+        print(f"  {'─'*50}")
+        print_pose(current_c2w, indent="    ")
+        print(f"    Image: {current_rgb}")
+        if current_depth:
+            print(f"    Depth: {current_depth}")
+
+        history = build_history_string(spatial_rounds, phase="spatial")
+        prompt = SPATIAL_PROMPT.replace("{HISTORY}", history)
+        messages = build_prompt(current_rgb, prompt, depth_path=current_depth)
+        response = call_vlm(messages, api_key=api_key, model=args.model)
+
+        print(f"    VLM Response:")
+        print_vlm_response(response, indent="      ")
+
+        rtx, rty, rtz = c2w_to_translation(current_c2w)
+        rroll, rpitch, ryaw = c2w_to_rpy_deg(current_c2w)
+        spatial_rounds.append({
+            "round": sp_round,
+            "rgb_path": current_rgb,
+            "depth_path": current_depth,
+            "camera_pose_c2w": current_c2w.tolist(),
+            "translation": [rtx, rty, rtz],
+            "rotation_rpy_deg": [rroll, rpitch, ryaw],
+            "response": response,
+        })
+
+        if not isinstance(response, dict):
+            print(f"    Result: Invalid response, stopping.")
+            break
+
+        if not response.get("request_new_view", False):
+            lat = response.get("lateral", "?")
+            dep = response.get("depth", "?")
+            vert = response.get("vertical", "?")
+            conf = response.get("confidence", "?")
+            print(f"    >> Final answer: lateral={lat}  depth={dep}  vertical={vert}  confidence={conf}")
+            break
+
+        req_trans = response.get("requested_translation", "").strip()
+        req_rot = response.get("requested_rotation", "").strip()
+        if not req_trans and not req_rot:
+            print(f"    >> No movement specified, stopping.")
+            break
+
+        from_initial = response.get("from_initial", False)
+        base_label = "initial" if from_initial else "current"
+        print(f"    >> Requesting new view (from {base_label}): translate=[{req_trans or 'none'}] rotate=[{req_rot or 'none'}]")
+
+        base_c2w = c2w.copy() if from_initial else current_c2w
+        current_c2w = apply_view_request(base_c2w, req_trans, req_rot)
+        current_rgb, current_depth = render_and_get_paths(
+            current_c2w, f"spatial_{idx:04d}_round{sp_round + 1}")
+
+    # ===================================================================
+    # Summary
+    # ===================================================================
+    print(f"\n{'='*70}")
+    print(f"  SUMMARY")
+    print(f"{'='*70}")
+    print(f"  Status:           completed")
+    print(f"  Detection rounds: {len(detection_rounds)}")
+    print(f"  Spatial rounds:   {len(spatial_rounds)}")
+    if isinstance(response, dict) and "lateral" in response:
+        print(f"  Final answer:")
+        print(f"    Lateral:    {response.get('lateral', '?')}")
+        print(f"    Depth:      {response.get('depth', '?')}")
+        print(f"    Vertical:   {response.get('vertical', '?')}")
+        print(f"    Confidence: {response.get('confidence', '?')}")
+    print(f"{'='*70}")
 
     # Save result
     output = {
         "experiment_dir": args.experiment_dir,
         "frame_index": idx,
         "use_rendered": args.use_rendered,
+        "use_depth": args.use_depth,
         "model": args.model,
-        "task_question": TASK_QUESTION.strip(),
+        "object_1": OBJECT_1,
+        "object_2": OBJECT_2,
+        "status": "completed",
         "camera_info": camera_info,
-        "rgb_path": rgb_path,
-        "rendered_path": rendered_path,
-        "gt_depth_path": frame["gt_depth_path"],
-        "gs_depth_path": frame["gs_depth_path"],
-        "camera_pose_c2w": c2w.tolist(),
-        "translation": [tx, ty, tz],
-        "rotation_rpy_deg": [roll, pitch, yaw],
-        "novel_view": {
-            "path": novel_path,
-            "camera_pose_c2w": novel_c2w.tolist(),
-            "translation": [novel_tx, novel_ty, novel_tz],
-            "rotation_rpy_deg": [novel_roll, novel_pitch, novel_yaw],
-            "offset_world_z_m": 1.0,
-        },
-        "response": response,
+        "detection_rounds": detection_rounds,
+        "spatial_rounds": spatial_rounds,
     }
 
     out_path = os.path.join(output_dir, "vlm_evaluation.json")
     with open(out_path, "w") as f:
         json.dump(output, f, indent=2)
 
-    print(f"\nResults saved to: {out_path}")
+    print(f"\n  Results saved to: {out_path}")
 
 
 if __name__ == "__main__":
