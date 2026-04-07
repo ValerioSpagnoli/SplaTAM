@@ -1,16 +1,3 @@
-"""
-VLM evaluation using Condition A prompt on experiment images.
-
-The script expects the standard experiment layout:
-    <experiment_dir>/eval/rgb
-    <experiment_dir>/eval/depth
-    <experiment_dir>/eval/rendered_rgb
-    <experiment_dir>/eval/rendered_depth
-
-It evaluates one or more RGB images and can optionally include the matching
-depth image in the same prompt.
-"""
-
 import argparse
 import base64
 import json
@@ -20,7 +7,29 @@ import time
 from glob import glob
 
 
-TASK_QUESTIONS = " "
+TASK_QUESTIONS = """ 
+Describe which objects are visible in the scene and which is their spatial relationship and how distant are from the robot.
+Answer in JSON format with the following structure:
+{
+  "objects": [
+    {
+      "name": "object name or category",
+      "relationship_to_robot": "description of spatial relationship to the robot (e.g., 'to the left', 'in front')",
+      "distance": "estimated distance from the robot (metric)",
+      "spatial_relationships": [
+        {
+          "other_object": "name of another object",
+          "relationship_to_object": "description of spatial relationship (e.g., 'to the left of', 'in front of')"
+          "distance": "estimated distance between the two objects (metric)"
+        },
+        ...
+      ]
+    },
+    ...
+  ]
+}
+
+"""
 
 
 def encode_image_b64(image_path: str) -> str:
@@ -75,8 +84,47 @@ def build_prompt(rgb_path: str, depth_path: str | None = None) -> list:
         }
     ]
 
-def call_vlm(messages: list, api_key: str, model: str = "gpt-4o") -> dict:
+def call_vlm(messages: list, api_key: str, model: str = "gpt-4o", expect_json: bool = False) -> dict:
     import httpx
+
+    def _strip_code_fences(text: str) -> str:
+        cleaned = text.strip()
+        if not cleaned.startswith("```"):
+            return cleaned
+
+        lines = cleaned.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+
+        # Handle accidental leading "json" token outside the code fence line.
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:].lstrip("\n :")
+        return cleaned
+
+    def _parse_json_from_response(content: str) -> tuple[dict | list | None, str | None]:
+        cleaned = _strip_code_fences(content)
+
+        # Fast path: already valid JSON.
+        try:
+            return json.loads(cleaned), None
+        except json.JSONDecodeError:
+            pass
+
+        # Fallback: find the first valid JSON object/array embedded in prose.
+        decoder = json.JSONDecoder()
+        for i, ch in enumerate(cleaned):
+            if ch not in "[{":
+                continue
+            try:
+                parsed, _ = decoder.raw_decode(cleaned[i:])
+                return parsed, None
+            except json.JSONDecodeError:
+                continue
+
+        return None, "No valid JSON object/array found in model output"
 
     headers = {
         "Content-Type": "application/json",
@@ -88,6 +136,8 @@ def call_vlm(messages: list, api_key: str, model: str = "gpt-4o") -> dict:
         "max_tokens": 1000,
         "temperature": 0.0,
     }
+    if expect_json:
+        payload["response_format"] = {"type": "json_object"}
 
     for attempt in range(3):
         try:
@@ -101,15 +151,26 @@ def call_vlm(messages: list, api_key: str, model: str = "gpt-4o") -> dict:
             result = response.json()
             content = result["choices"][0]["message"]["content"].strip()
 
-            if content.startswith("```"):
-                content = content.split("\n", 1)[1]
-                content = content.rsplit("```", 1)[0]
+            parsed, parse_err = _parse_json_from_response(content)
+            if parse_err is None:
+                return parsed if isinstance(parsed, dict) else {"parsed_response": parsed}
 
-            return json.loads(content)
+            # In general mode, plain text answers are valid and should not be treated as errors.
+            if not expect_json:
+                return {
+                    "text_response": content,
+                    "response_format": "plain_text",
+                }
+
+            raise json.JSONDecodeError(parse_err, content, 0)
         except (json.JSONDecodeError, KeyError) as e:
             print(f"  Warning: JSON parse failed (attempt {attempt+1}): {e}")
             if attempt == 2:
-                return {"raw_response": content, "parse_error": str(e)}
+                return {
+                    "raw_response": content,
+                    "raw_response_lines": content.splitlines(),
+                    "parse_error": str(e),
+                }
         except Exception as e:
             print(f"  Warning: API error (attempt {attempt+1}): {e}")
             if attempt < 2:
@@ -174,6 +235,7 @@ def evaluate(
     image_idx: str,
     use_rendered: bool,
     use_depth: bool,
+    expect_json: bool,
     image_glob: str,
     api_key: str,
     model: str,
@@ -213,6 +275,7 @@ def evaluate(
     print(f"Image glob:         {image_glob}")
     print(f"Images to evaluate: {len(image_paths)}")
     print(f"Model:              {model}")
+    print(f"Expect JSON:        {expect_json}")
     print()
 
     aggregate = {
@@ -221,6 +284,7 @@ def evaluate(
         "depth_dir": depth_dir if use_depth else None,
         "use_rendered": use_rendered,
         "use_depth": use_depth,
+        "expect_json": expect_json,
         "image_idx": image_idx,
         "image_glob": image_glob,
         "model": model,
@@ -239,7 +303,7 @@ def evaluate(
                 print(f"  Warning: matching depth not found for {image_name}, using RGB only")
 
         messages = build_prompt(image_path, depth_path=depth_path)
-        response = call_vlm(messages, api_key=api_key, model=model)
+        response = call_vlm(messages, api_key=api_key, model=model, expect_json=expect_json)
 
         entry = {
             "image_path": image_path,
@@ -251,6 +315,11 @@ def evaluate(
         per_image_path = os.path.join(output_dir, f"{os.path.splitext(image_name)[0]}.json")
         with open(per_image_path, "w") as f:
             json.dump(entry, f, indent=2)
+
+        if isinstance(response, dict) and "parse_error" in response and "raw_response" in response:
+            raw_text_path = os.path.join(output_dir, f"{os.path.splitext(image_name)[0]}_raw_response.txt")
+            with open(raw_text_path, "w") as f:
+                f.write(response["raw_response"])
 
         print(f"  Saved: {per_image_path}")
 
@@ -273,8 +342,9 @@ if __name__ == "__main__":
     parser.add_argument("--experiment_dir", type=str, required=True, help="Directory of the experiment")
     parser.add_argument("--image_idx", type=str, default="-1", help="Image index (by sorted order) or frame id; use '-1' for all")
     parser.add_argument("--max_images", type=int, default=-1, help="Maximum number of images to evaluate (-1 for all)")
-    parser.add_argument("--use_rendered", action=argparse.BooleanOptionalAction, default=True, help="Use rendered images from eval/rendered_* instead of eval/*")
+    parser.add_argument("--use_rendered", action=argparse.BooleanOptionalAction, default=False, help="Use rendered images from eval/rendered_* instead of eval/*")
     parser.add_argument("--use_depth", action=argparse.BooleanOptionalAction, default=False, help="Include depth image in the prompt")
+    parser.add_argument("--expect_json", action=argparse.BooleanOptionalAction, default=False, help="Require JSON output from model")
     parser.add_argument("--image_glob", type=str, default="*.png", help="Glob for images inside selected RGB directory")
     parser.add_argument("--model", type=str, default="gpt-4o", help="Model name (gpt-4o, gpt-4o-mini)")
     parser.add_argument("--output_dir", type=str, default=None, help="Output directory for json results")
@@ -288,7 +358,7 @@ if __name__ == "__main__":
 
     output_dir = args.output_dir
     if output_dir is None:
-        output_dir = os.path.join(args.experiment_dir, "vlm_eval_condition_a")
+        output_dir = os.path.join(args.experiment_dir, "vlm_evaluation_results")
         output_dir = os.path.normpath(output_dir)
 
     evaluate(
@@ -296,6 +366,7 @@ if __name__ == "__main__":
         image_idx=args.image_idx,
         use_rendered=args.use_rendered,
         use_depth=args.use_depth,
+        expect_json=args.expect_json,
         image_glob=args.image_glob,
         max_images=args.max_images,
         model=args.model,

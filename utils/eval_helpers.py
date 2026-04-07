@@ -20,6 +20,18 @@ from pytorch_msssim import ms_ssim
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 loss_fn_alex = LearnedPerceptualImagePatchSimilarity(net_type='alex', normalize=True).cuda()
 
+METRIC_DEPTH_PNG_SCALE = 1000.0  # meters -> uint16 millimeters
+
+
+def save_metric_depth_png(depth_m: np.ndarray, out_path: str, scale: float = METRIC_DEPTH_PNG_SCALE):
+    """Save metric depth (meters) as uint16 PNG using a fixed scale."""
+    depth = np.array(depth_m, dtype=np.float32)
+    valid = np.isfinite(depth) & (depth > 0)
+    depth_u16 = np.zeros(depth.shape, dtype=np.uint16)
+    scaled = np.clip(depth[valid] * scale, 0, 65535)
+    depth_u16[valid] = scaled.astype(np.uint16)
+    cv2.imwrite(out_path, depth_u16)
+
 def align(model, data):
     """Align two trajectories using the method of Horn (closed-form).
 
@@ -420,10 +432,14 @@ def eval(dataset, final_params, num_frames, eval_dir, sil_thres,
         os.makedirs(render_rgb_dir, exist_ok=True)
         render_depth_dir = os.path.join(eval_dir, "rendered_depth")
         os.makedirs(render_depth_dir, exist_ok=True)
+        render_depth_metric_dir = os.path.join(eval_dir, "rendered_depth_metric")
+        os.makedirs(render_depth_metric_dir, exist_ok=True)
         rgb_dir = os.path.join(eval_dir, "rgb")
         os.makedirs(rgb_dir, exist_ok=True)
         depth_dir = os.path.join(eval_dir, "depth")
         os.makedirs(depth_dir, exist_ok=True)
+        depth_metric_dir = os.path.join(eval_dir, "depth_metric")
+        os.makedirs(depth_metric_dir, exist_ok=True)
 
     gt_w2c_list = []
     for time_idx in tqdm(range(num_frames)):
@@ -517,6 +533,10 @@ def eval(dataset, final_params, num_frames, eval_dir, sil_thres,
             depth_colormap = cv2.applyColorMap((normalized_depth * 255).astype(np.uint8), cv2.COLORMAP_JET)
             cv2.imwrite(os.path.join(render_rgb_dir, "gs_{:04d}.png".format(time_idx)), cv2.cvtColor(viz_render_im*255, cv2.COLOR_RGB2BGR))
             cv2.imwrite(os.path.join(render_depth_dir, "gs_{:04d}.png".format(time_idx)), depth_colormap)
+            save_metric_depth_png(
+                viz_render_depth,
+                os.path.join(render_depth_metric_dir, "gs_{:04d}.png".format(time_idx)),
+            )
 
             # Save GT RGB and Depth
             viz_gt_im = torch.clamp(curr_data['im'], 0, 1)
@@ -526,6 +546,10 @@ def eval(dataset, final_params, num_frames, eval_dir, sil_thres,
             depth_colormap = cv2.applyColorMap((normalized_depth * 255).astype(np.uint8), cv2.COLORMAP_JET)
             cv2.imwrite(os.path.join(rgb_dir, "gt_{:04d}.png".format(time_idx)), cv2.cvtColor(viz_gt_im*255, cv2.COLOR_RGB2BGR))
             cv2.imwrite(os.path.join(depth_dir, "gt_{:04d}.png".format(time_idx)), depth_colormap)
+            save_metric_depth_png(
+                viz_gt_depth,
+                os.path.join(depth_metric_dir, "gt_{:04d}.png".format(time_idx)),
+            )
         
         # Plot the Ground Truth and Rasterized RGB & Depth, along with Silhouette
         fig_title = "Time Step: {}".format(time_idx)
@@ -639,10 +663,14 @@ def eval_nvs(dataset, final_params, num_frames, eval_dir, sil_thres,
         os.makedirs(render_rgb_dir, exist_ok=True)
         render_depth_dir = os.path.join(eval_dir, "rendered_depth")
         os.makedirs(render_depth_dir, exist_ok=True)
+        render_depth_metric_dir = os.path.join(eval_dir, "rendered_depth_metric")
+        os.makedirs(render_depth_metric_dir, exist_ok=True)
         rgb_dir = os.path.join(eval_dir, "rgb")
         os.makedirs(rgb_dir, exist_ok=True)
         depth_dir = os.path.join(eval_dir, "depth")
         os.makedirs(depth_dir, exist_ok=True)
+        depth_metric_dir = os.path.join(eval_dir, "depth_metric")
+        os.makedirs(depth_metric_dir, exist_ok=True)
 
     for time_idx in tqdm(range(num_frames)):
          # Get RGB-D Data & Camera Parameters
@@ -763,6 +791,10 @@ def eval_nvs(dataset, final_params, num_frames, eval_dir, sil_thres,
             depth_colormap = cv2.applyColorMap((normalized_depth * 255).astype(np.uint8), cv2.COLORMAP_JET)
             cv2.imwrite(os.path.join(render_rgb_dir, "splatam_{:04d}.png".format(test_time_idx)), cv2.cvtColor(viz_render_im*255, cv2.COLOR_RGB2BGR))
             cv2.imwrite(os.path.join(render_depth_dir, "splatam_{:04d}.png".format(test_time_idx)), depth_colormap)
+            save_metric_depth_png(
+                viz_render_depth,
+                os.path.join(render_depth_metric_dir, "splatam_{:04d}.png".format(test_time_idx)),
+            )
 
             # Save GT RGB and Depth
             viz_gt_im = torch.clamp(curr_data['im'], 0, 1)
@@ -772,6 +804,10 @@ def eval_nvs(dataset, final_params, num_frames, eval_dir, sil_thres,
             depth_colormap = cv2.applyColorMap((normalized_depth * 255).astype(np.uint8), cv2.COLORMAP_JET)
             cv2.imwrite(os.path.join(rgb_dir, "gt_{:04d}.png".format(test_time_idx)), cv2.cvtColor(viz_gt_im*255, cv2.COLOR_RGB2BGR))
             cv2.imwrite(os.path.join(depth_dir, "gt_{:04d}.png".format(test_time_idx)), depth_colormap)
+            save_metric_depth_png(
+                viz_gt_depth,
+                os.path.join(depth_metric_dir, "gt_{:04d}.png".format(test_time_idx)),
+            )
         
         # Plot the Ground Truth and Rasterized RGB & Depth, along with Silhouette
         fig_title = "Time Step: {}".format(test_time_idx)
