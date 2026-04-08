@@ -58,46 +58,62 @@ OBJECT_1 = "Computer monitor"
 OBJECT_2 = "Orange frame picture on one of the desks"
 MAX_DETECTION_ROUNDS = 10
 MAX_SPATIAL_ROUNDS = 5
-USE_ONLY_ROTATIONS_IN_DETECTION_LOOP = True
+TRANSLATION_STEP_M = 0.5
+ROTATION_STEP_DEG = 45.0
 
-if USE_ONLY_ROTATIONS_IN_DETECTION_LOOP:
-    _DETECTION_MOVEMENTS = """Available camera movements to look around:
-  Rotation (15 deg step): "tilt_up", "tilt_down", "pan_left", "pan_right"
+DETECTION_PLANNING_PROMPT = f"""
+You are controlling a robot camera in an indoor scene. You need to find both of these objects:
+1. {OBJECT_1}
+2. {OBJECT_2}
 
-IMPORTANT: You can ONLY use rotations during detection. Do NOT request any translation — "requested_translation" must always be ""."""
-    _DETECTION_STRATEGY = """Exploration strategy:
-  1. Scan by rotating in BOTH directions (pan_left AND pan_right, tilt_up AND tilt_down) from the initial pose.
-  2. If one direction does not work, use "from_initial": true to reset and try a different rotation direction.
-  3. Never keep rotating in the same direction more than 2-3 times — if it did not work, try the opposite direction."""
-    _DETECTION_TRANSLATION_SCHEMA = '    "requested_translation": "",'
-else:
-    _DETECTION_MOVEMENTS = """Available camera movements to look around:
-  Translation (0.15 m step): "up", "down", "left", "right", "forward", "backward"
-  Rotation (15 deg step):    "tilt_up", "tilt_down", "pan_left", "pan_right" """
-    _DETECTION_STRATEGY = """Exploration strategy:
-  1. First scan by rotating in BOTH directions (pan_left AND pan_right, tilt_up AND tilt_down) from the initial pose.
-  2. If rotations alone do not reveal the object, use "from_initial": true to reset to the starting pose and then translate to a new position.
-  3. Never keep panning in the same direction more than 2-3 times — if it did not work, try the opposite direction or a translation."""
-    _DETECTION_TRANSLATION_SCHEMA = '    "requested_translation": "" | "up" | "down" | "left" | "right" | "forward" | "backward",'
+{{POSE_INFO}}
 
-DETECTION_PROMPT = f"""
+This is the image from the robot's current (initial) camera pose. Analyze the scene carefully.
+
+Your task is to understand the scene layout and reason about where each object is likely to be. Do NOT plan specific camera movements — just describe what you see and where the objects might be.
+
+Consider:
+  - What is the overall scene layout?
+  - Which objects (if any) are already visible in this image?
+  - For missing objects: based on their nature and the scene layout, where are they most likely located?
+  - Are there any visual clues that hint at where to look?
+
+Return only valid JSON (no markdown, no extra text) with exactly this schema:
+{{
+    "object_1_visible": boolean,
+    "object_2_visible": boolean,
+    "both_visible": boolean,
+    "scene_description": string,
+    "object_1_location_hint": string,
+    "object_2_location_hint": string,
+    "suggested_search_direction": string,
+    "reasoning": string
+}}
+"""
+
+DETECTION_EXECUTION_PROMPT = f"""
 Look at this image from an indoor robot scene. Do you see both of these objects?
 1. {OBJECT_1}
 2. {OBJECT_2}
 
-{_DETECTION_MOVEMENTS}
+{{POSE_INFO}}
 
-You have a maximum of {MAX_DETECTION_ROUNDS} attempts to find both objects, so be strategic. Do NOT repeat the same movement — vary your exploration.
+Available camera movements:
+  Translation ({TRANSLATION_STEP_M} m step): "up", "down", "left", "right", "forward", "backward"
+  Rotation ({ROTATION_STEP_DEG} deg step):    "tilt_up", "tilt_down", "pan_left", "pan_right"
 
-{_DETECTION_STRATEGY}
+You have a maximum of {MAX_DETECTION_ROUNDS} attempts total. Do NOT repeat a movement that already failed.
 
-IMPORTANT — "from_initial" field:
-  - "from_initial": false → the requested movement is applied ON TOP of the current camera pose (incremental).
-  - "from_initial": true  → the camera is RESET to the starting pose BEFORE applying the requested movement. Use this when you have already rotated or moved far from the start and want to try a completely different direction.
+"from_initial" field:
+  - false → movement is applied ON TOP of the current camera pose (incremental).
+  - true  → camera is RESET to the starting pose BEFORE applying the movement.
 
-IMPORTANT — You will be told what movements you already tried. Do NOT repeat a movement that already failed. Try something different.
+Scene analysis from initial observation:
+{{SCENE_ANALYSIS}}
 
 {{HISTORY}}
+
+Use the scene analysis to guide your search. Adapt based on what you see in the current image.
 
 Return only valid JSON (no markdown, no extra text) with exactly this schema:
 {{
@@ -107,7 +123,7 @@ Return only valid JSON (no markdown, no extra text) with exactly this schema:
     "reasoning": string,
     "request_new_view": boolean,
     "from_initial": boolean,
-{_DETECTION_TRANSLATION_SCHEMA}
+    "requested_translation": "" | "up" | "down" | "left" | "right" | "forward" | "backward",
     "requested_rotation": "" | "tilt_up" | "tilt_down" | "pan_left" | "pan_right",
     "new_view_reasoning": string
 }}
@@ -118,6 +134,8 @@ You can see both objects in this image:
 1. {OBJECT_1}
 2. {OBJECT_2}
 
+{{POSE_INFO}}
+
 Determine the spatial relationship of the first object relative to the second object along all three axes:
   - left/right (lateral)
   - in front of/behind (depth)
@@ -126,8 +144,8 @@ Determine the spatial relationship of the first object relative to the second ob
 If you are confident, return your answer. If the relationship is uncertain or ambiguous from this viewpoint, you may request a new camera view to disambiguate.
 
 Available camera movements (you can combine one translation and one rotation):
-  Translation (0.15 m step): "up", "down", "left", "right", "forward", "backward"
-  Rotation (15 deg step):    "tilt_up", "tilt_down", "pan_left", "pan_right"
+  Translation ({TRANSLATION_STEP_M} m step): "up", "down", "left", "right", "forward", "backward"
+  Rotation ({ROTATION_STEP_DEG} deg step):    "tilt_up", "tilt_down", "pan_left", "pan_right"
 
 You have a maximum of {MAX_SPATIAL_ROUNDS} attempts to determine the spatial relationship.
 
@@ -151,9 +169,6 @@ Return only valid JSON (no markdown, no extra text) with exactly this schema:
     "new_view_reasoning": string
 }}
 """
-
-TRANSLATION_STEP_M = 0.15
-ROTATION_STEP_DEG = 15.0
 
 # Maps VLM action strings to c2w offsets in first-camera frame
 TRANSLATION_MAP = {
@@ -211,6 +226,24 @@ def rotation_z(angle_deg):
     """Rotation around first-camera Z axis (= world X, roll)."""
     a = math.radians(angle_deg)
     return np.array([[math.cos(a),-math.sin(a),0],[math.sin(a),math.cos(a),0],[0,0,1]])
+
+def build_pose_info(initial_c2w: np.ndarray, current_c2w: np.ndarray) -> str:
+    """Build a description of the robot's initial and current pose for the VLM."""
+    ix, iy, iz = c2w_to_translation(initial_c2w)
+    ir, ip, iyaw = c2w_to_rpy_deg(initial_c2w)
+    cx, cy, cz = c2w_to_translation(current_c2w)
+    cr, cp, cyaw = c2w_to_rpy_deg(current_c2w)
+
+    lines = [
+        "Robot camera pose information:",
+        f"  Initial pose: position=({ix:.3f}, {iy:.3f}, {iz:.3f})  orientation=(roll={ir:.1f}°, pitch={ip:.1f}°, yaw={iyaw:.1f}°)",
+        f"  Current pose: position=({cx:.3f}, {cy:.3f}, {cz:.3f})  orientation=(roll={cr:.1f}°, pitch={cp:.1f}°, yaw={cyaw:.1f}°)",
+        "  Orientation meaning: yaw=0° means facing straight ahead. Negative yaw = looking left, positive yaw = looking right.",
+        "  Pitch: negative = looking down, positive = looking up.",
+        "  Movements are relative to the camera: 'left'/'right' translate sideways, 'forward'/'backward' along the viewing direction, 'up'/'down' vertically.",
+    ]
+    return "\n".join(lines)
+
 
 def build_history_string(rounds_list: list[dict], phase: str = "detection") -> str:
     """Build a summary of previous rounds for the VLM to avoid repeating moves."""
@@ -567,69 +600,112 @@ def main():
     current_depth = initial_depth_path
     both_visible = False
 
-    for det_round in range(1, MAX_DETECTION_ROUNDS + 1):
-        print(f"\n  {'─'*50}")
-        print(f"  Detection Round {det_round}/{MAX_DETECTION_ROUNDS}")
-        print(f"  {'─'*50}")
-        print_pose(current_c2w, indent="    ")
-        print(f"    Image: {current_rgb}")
-        if current_depth:
-            print(f"    Depth: {current_depth}")
+    # --- Planning stage ---
+    print(f"\n  {'─'*50}")
+    print(f"  Detection Planning")
+    print(f"  {'─'*50}")
+    print_pose(current_c2w, indent="    ")
+    print(f"    Image: {current_rgb}")
 
-        history = build_history_string(detection_rounds, phase="detection")
-        prompt = DETECTION_PROMPT.replace("{HISTORY}", history)
-        messages = build_prompt(current_rgb, prompt, depth_path=current_depth)
-        response = call_vlm(messages, api_key=api_key, model=args.model)
+    pose_info = build_pose_info(c2w, current_c2w)
+    planning_prompt = DETECTION_PLANNING_PROMPT.replace("{POSE_INFO}", pose_info)
+    planning_messages = build_prompt(current_rgb, planning_prompt, depth_path=current_depth)
+    planning_response = call_vlm(planning_messages, api_key=api_key, model=args.model)
 
-        print(f"    VLM Response:")
-        print_vlm_response(response, indent="      ")
+    print(f"    Planning Response:")
+    print_vlm_response(planning_response, indent="      ")
 
-        rtx, rty, rtz = c2w_to_translation(current_c2w)
-        rroll, rpitch, ryaw = c2w_to_rpy_deg(current_c2w)
-        detection_rounds.append({
-            "round": det_round,
-            "rgb_path": current_rgb,
-            "depth_path": current_depth,
-            "camera_pose_c2w": current_c2w.tolist(),
-            "translation": [rtx, rty, rtz],
-            "rotation_rpy_deg": [rroll, rpitch, ryaw],
-            "response": response,
-        })
+    # Extract scene analysis to pass into each execution round
+    if isinstance(planning_response, dict):
+        scene_analysis_parts = []
+        if planning_response.get("scene_description"):
+            scene_analysis_parts.append(f"Scene: {planning_response['scene_description']}")
+        if planning_response.get("object_1_location_hint"):
+            scene_analysis_parts.append(f"{OBJECT_1} hint: {planning_response['object_1_location_hint']}")
+        if planning_response.get("object_2_location_hint"):
+            scene_analysis_parts.append(f"{OBJECT_2} hint: {planning_response['object_2_location_hint']}")
+        if planning_response.get("suggested_search_direction"):
+            scene_analysis_parts.append(f"Suggested direction: {planning_response['suggested_search_direction']}")
+        scene_analysis_str = "\n".join(scene_analysis_parts) if scene_analysis_parts else "No scene analysis available."
+        # Check if both are already visible from the planning image
+        if planning_response.get("both_visible", False):
+            both_visible = True
+            print(f"    >> Both objects already visible! Skipping detection loop.")
+            response = planning_response
+    else:
+        scene_analysis_str = "No scene analysis available — explore freely."
 
-        if not isinstance(response, dict):
-            print(f"    Result: Invalid response, stopping.")
-            break
+    print(f"\n    Scene analysis:")
+    for line in scene_analysis_str.splitlines():
+        print(f"      {line}")
 
-        obj1 = response.get("object_1_visible", False)
-        obj2 = response.get("object_2_visible", False)
-        both_visible = response.get("both_visible", False)
-        print(f"    Visibility: obj1={'YES' if obj1 else 'NO'}  obj2={'YES' if obj2 else 'NO'}")
+    # --- Execution loop ---
+    if not both_visible:
+        for det_round in range(1, MAX_DETECTION_ROUNDS + 1):
+            print(f"\n  {'─'*50}")
+            print(f"  Detection Round {det_round}/{MAX_DETECTION_ROUNDS}")
+            print(f"  {'─'*50}")
+            print_pose(current_c2w, indent="    ")
+            print(f"    Image: {current_rgb}")
+            if current_depth:
+                print(f"    Depth: {current_depth}")
 
-        if both_visible:
-            print(f"    >> Both objects detected! Moving to Phase 2.")
-            break
+            pose_info = build_pose_info(c2w, current_c2w)
+            history = build_history_string(detection_rounds, phase="detection")
+            if history:
+                print(f"    History passed to VLM:")
+                for line in history.splitlines():
+                    print(f"      {line}")
+            prompt = DETECTION_EXECUTION_PROMPT.replace("{POSE_INFO}", pose_info).replace("{SCENE_ANALYSIS}", scene_analysis_str).replace("{HISTORY}", history)
+            messages = build_prompt(current_rgb, prompt, depth_path=current_depth)
+            response = call_vlm(messages, api_key=api_key, model=args.model)
 
-        if not response.get("request_new_view", False):
-            print(f"    >> VLM did not request a new view, stopping.")
-            break
+            print(f"    VLM Response:")
+            print_vlm_response(response, indent="      ")
 
-        req_trans = response.get("requested_translation", "").strip()
-        req_rot = response.get("requested_rotation", "").strip()
-        if USE_ONLY_ROTATIONS_IN_DETECTION_LOOP and req_trans:
-            print(f"    >> Ignoring translation '{req_trans}' (rotations only in detection)")
-            req_trans = ""
-        if not req_trans and not req_rot:
-            print(f"    >> No movement specified, stopping.")
-            break
+            rtx, rty, rtz = c2w_to_translation(current_c2w)
+            rroll, rpitch, ryaw = c2w_to_rpy_deg(current_c2w)
+            detection_rounds.append({
+                "round": det_round,
+                "rgb_path": current_rgb,
+                "depth_path": current_depth,
+                "camera_pose_c2w": current_c2w.tolist(),
+                "translation": [rtx, rty, rtz],
+                "rotation_rpy_deg": [rroll, rpitch, ryaw],
+                "response": response,
+            })
 
-        from_initial = response.get("from_initial", False)
-        base_label = "initial" if from_initial else "current"
-        print(f"    >> Requesting new view (from {base_label}): translate=[{req_trans or 'none'}] rotate=[{req_rot or 'none'}]")
+            if not isinstance(response, dict):
+                print(f"    Result: Invalid response, stopping.")
+                break
 
-        base_c2w = c2w.copy() if from_initial else current_c2w
-        current_c2w = apply_view_request(base_c2w, req_trans, req_rot)
-        current_rgb, current_depth = render_and_get_paths(
-            current_c2w, f"detect_{idx:04d}_round{det_round + 1}")
+            obj1 = response.get("object_1_visible", False)
+            obj2 = response.get("object_2_visible", False)
+            both_visible = response.get("both_visible", False)
+            print(f"    Visibility: obj1={'YES' if obj1 else 'NO'}  obj2={'YES' if obj2 else 'NO'}")
+
+            if both_visible:
+                print(f"    >> Both objects detected! Moving to Phase 2.")
+                break
+
+            if not response.get("request_new_view", False):
+                print(f"    >> VLM did not request a new view, stopping.")
+                break
+
+            req_trans = response.get("requested_translation", "").strip()
+            req_rot = response.get("requested_rotation", "").strip()
+            if not req_trans and not req_rot:
+                print(f"    >> No movement specified, stopping.")
+                break
+
+            from_initial = response.get("from_initial", False)
+            base_label = "initial" if from_initial else "current"
+            print(f"    >> Requesting new view (from {base_label}): translate=[{req_trans or 'none'}] rotate=[{req_rot or 'none'}]")
+
+            base_c2w = c2w.copy() if from_initial else current_c2w
+            current_c2w = apply_view_request(base_c2w, req_trans, req_rot)
+            current_rgb, current_depth = render_and_get_paths(
+                current_c2w, f"detect_{idx:04d}_round{det_round + 1}")
 
     if not both_visible:
         obj1_vis = response.get("object_1_visible", False) if isinstance(response, dict) else False
@@ -657,6 +733,7 @@ def main():
             "status": "detection_failed",
             "missing_objects": missing,
             "camera_info": camera_info,
+            "detection_planning": planning_response,
             "detection_rounds": detection_rounds,
         }
 
@@ -683,8 +760,13 @@ def main():
         if current_depth:
             print(f"    Depth: {current_depth}")
 
+        pose_info = build_pose_info(c2w, current_c2w)
         history = build_history_string(spatial_rounds, phase="spatial")
-        prompt = SPATIAL_PROMPT.replace("{HISTORY}", history)
+        if history:
+            print(f"    History passed to VLM:")
+            for line in history.splitlines():
+                print(f"      {line}")
+        prompt = SPATIAL_PROMPT.replace("{POSE_INFO}", pose_info).replace("{HISTORY}", history)
         messages = build_prompt(current_rgb, prompt, depth_path=current_depth)
         response = call_vlm(messages, api_key=api_key, model=args.model)
 
@@ -758,6 +840,7 @@ def main():
         "object_2": OBJECT_2,
         "status": "completed",
         "camera_info": camera_info,
+        "detection_planning": planning_response,
         "detection_rounds": detection_rounds,
         "spatial_rounds": spatial_rounds,
     }
