@@ -54,12 +54,13 @@ from utils.slam_helpers import (
 )
 
 
-OBJECT_1 = "Computer monitor"
-OBJECT_2 = "Orange frame picture on one of the desks"
+OBJECT_1 = "Orange frame picture on one of the desks"
+OBJECT_2 = "Computer monitor"
 MAX_DETECTION_ROUNDS = 10
 MAX_SPATIAL_ROUNDS = 5
 TRANSLATION_STEP_M = 0.5
 ROTATION_STEP_DEG = 45.0
+NUM_RUNS = 10
 
 DETECTION_PLANNING_PROMPT = f"""
 You are controlling a robot camera in an indoor scene. You need to find both of these objects:
@@ -498,69 +499,32 @@ def call_vlm(messages: list, api_key: str, model: str) -> dict:
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(description="Minimal VLM evaluation on RGB images")
-    parser.add_argument("--experiment_dir", type=str, required=True)
-    parser.add_argument("--image_idx", type=int, required=True, help="Frame index to evaluate")
-    parser.add_argument("--use_rendered", action="store_true", help="Use rendered RGB instead of GT")
-    parser.add_argument("--use_depth", action="store_true", help="Include depth map in VLM prompt")
-    parser.add_argument("--model", type=str, default="gpt-4o")
-    parser.add_argument("--output_dir", type=str, default=None)
-    parser.add_argument("--api_key", type=str, default=None)
-    args = parser.parse_args()
-
-    api_key = args.api_key or os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        print("Error: provide --api_key or set OPENAI_API_KEY")
-        sys.exit(1)
-
-    eval_dir = os.path.join(args.experiment_dir, "eval")
-    frames = load_frames_index(eval_dir)
-    camera_info = load_camera_info(eval_dir)
-
-    frame = get_frame(frames, args.image_idx)
-    if frame is None:
-        print(f"Error: frame {args.image_idx} not found in frames_index.csv")
-        sys.exit(1)
-
-    output_dir = args.output_dir or os.path.join(args.experiment_dir, str(args.image_idx))
-    os.makedirs(output_dir, exist_ok=True)
-
-    render_dir = os.path.join(output_dir, "novel_view")
-    os.makedirs(render_dir, exist_ok=True)
-
-    # Load 3DGS checkpoint and render from the frame's pose
-    print(f"Loading 3DGS checkpoint...")
-    params = load_checkpoint(args.experiment_dir)
+def run_single_experiment(
+    run_id: int,
+    params: dict,
+    frame: dict,
+    camera_info: dict,
+    rgb_path: str,
+    initial_depth_path: str | None,
+    c2w: np.ndarray,
+    render_dir: str,
+    output_dir: str,
+    api_key: str,
+    model: str,
+    use_depth: bool,
+    use_rendered: bool,
+    experiment_dir: str,
+) -> dict:
+    """Run a single experiment and return a result dict."""
 
     idx = frame["index"]
-    c2w = frame["camera_pose"]
-    tx, ty, tz = c2w_to_translation(c2w)
-    roll, pitch, yaw = c2w_to_rpy_deg(c2w)
-    rgb_path = frame["gs_rgb_path"] if args.use_rendered else frame["gt_rgb_path"]
 
-    print(f"{'='*70}")
-    print(f"  VLM Spatial Evaluation")
-    print(f"{'='*70}")
-    print(f"  Experiment:    {args.experiment_dir}")
-    print(f"  Frame:         {idx}")
-    print(f"  Source:        {'rendered' if args.use_rendered else 'ground truth'} RGB")
-    print(f"  Depth:         {'enabled' if args.use_depth else 'disabled'}")
-    print(f"  Model:         {args.model}")
-    print(f"  Objects:       1. {OBJECT_1}")
-    print(f"                 2. {OBJECT_2}")
-    print(f"  Initial pose:  t=[{tx:.3f}, {ty:.3f}, {tz:.3f}]  rpy=[{roll:.1f}, {pitch:.1f}, {yaw:.1f}] deg")
-    print(f"  Max detection: {MAX_DETECTION_ROUNDS} rounds")
-    print(f"  Max spatial:   {MAX_SPATIAL_ROUNDS} rounds")
-    print(f"{'='*70}")
-
-    # Helper to render and get depth for a given pose
     def render_and_get_paths(pose, tag):
         rgb_file = os.path.join(render_dir, f"{tag}.png")
         rgb_img, depth_arr = render_from_pose(params, pose, camera_info)
         cv2.imwrite(rgb_file, rgb_img)
         depth_file = None
-        if args.use_depth:
+        if use_depth:
             depth_file = os.path.join(render_dir, f"{tag}_depth.png")
             cv2.imwrite(depth_file, depth_to_colormap(depth_arr))
         return rgb_file, depth_file
@@ -573,19 +537,6 @@ def main():
     def print_vlm_response(resp, indent="  "):
         for line in json.dumps(resp, indent=2).splitlines():
             print(f"{indent}{line}")
-
-    # Resolve initial image and depth
-    rendered_path = os.path.join(render_dir, f"rendered_{idx:04d}.png")
-    rendered_img = render_frame(params, idx, camera_info)
-    cv2.imwrite(rendered_path, rendered_img)
-
-    initial_depth_path = None
-    if args.use_depth:
-        initial_depth = frame["gs_depth_path"] if args.use_rendered else frame["gt_depth_path"]
-        if os.path.isfile(initial_depth):
-            initial_depth_path = initial_depth
-        else:
-            print(f"  Warning: depth not found: {initial_depth}, proceeding without")
 
     # ===================================================================
     # Phase 1: Object Detection
@@ -610,7 +561,7 @@ def main():
     pose_info = build_pose_info(c2w, current_c2w)
     planning_prompt = DETECTION_PLANNING_PROMPT.replace("{POSE_INFO}", pose_info)
     planning_messages = build_prompt(current_rgb, planning_prompt, depth_path=current_depth)
-    planning_response = call_vlm(planning_messages, api_key=api_key, model=args.model)
+    planning_response = call_vlm(planning_messages, api_key=api_key, model=model)
 
     print(f"    Planning Response:")
     print_vlm_response(planning_response, indent="      ")
@@ -627,7 +578,6 @@ def main():
         if planning_response.get("suggested_search_direction"):
             scene_analysis_parts.append(f"Suggested direction: {planning_response['suggested_search_direction']}")
         scene_analysis_str = "\n".join(scene_analysis_parts) if scene_analysis_parts else "No scene analysis available."
-        # Check if both are already visible from the planning image
         if planning_response.get("both_visible", False):
             both_visible = True
             print(f"    >> Both objects already visible! Skipping detection loop.")
@@ -658,7 +608,7 @@ def main():
                     print(f"      {line}")
             prompt = DETECTION_EXECUTION_PROMPT.replace("{POSE_INFO}", pose_info).replace("{SCENE_ANALYSIS}", scene_analysis_str).replace("{HISTORY}", history)
             messages = build_prompt(current_rgb, prompt, depth_path=current_depth)
-            response = call_vlm(messages, api_key=api_key, model=args.model)
+            response = call_vlm(messages, api_key=api_key, model=model)
 
             print(f"    VLM Response:")
             print_vlm_response(response, indent="      ")
@@ -705,7 +655,7 @@ def main():
             base_c2w = c2w.copy() if from_initial else current_c2w
             current_c2w = apply_view_request(base_c2w, req_trans, req_rot)
             current_rgb, current_depth = render_and_get_paths(
-                current_c2w, f"detect_{idx:04d}_round{det_round + 1}")
+                current_c2w, f"run{run_id}_detect_{idx:04d}_round{det_round + 1}")
 
     if not both_visible:
         obj1_vis = response.get("object_1_visible", False) if isinstance(response, dict) else False
@@ -722,26 +672,23 @@ def main():
         print(f"  Missing: {', '.join(missing)}")
         print(f"  {'='*50}")
 
-        output = {
-            "experiment_dir": args.experiment_dir,
+        return {
+            "run_id": run_id,
+            "experiment_dir": experiment_dir,
             "frame_index": idx,
-            "use_rendered": args.use_rendered,
-            "use_depth": args.use_depth,
-            "model": args.model,
+            "use_rendered": use_rendered,
+            "use_depth": use_depth,
+            "model": model,
             "object_1": OBJECT_1,
             "object_2": OBJECT_2,
             "status": "detection_failed",
             "missing_objects": missing,
+            "detection_rounds_count": len(detection_rounds),
+            "spatial_rounds_count": 0,
             "camera_info": camera_info,
             "detection_planning": planning_response,
             "detection_rounds": detection_rounds,
         }
-
-        out_path = os.path.join(output_dir, "vlm_evaluation.json")
-        with open(out_path, "w") as f:
-            json.dump(output, f, indent=2)
-        print(f"\n  Results saved to: {out_path}")
-        return
 
     # ===================================================================
     # Phase 2: Spatial Relationship
@@ -768,7 +715,7 @@ def main():
                 print(f"      {line}")
         prompt = SPATIAL_PROMPT.replace("{POSE_INFO}", pose_info).replace("{HISTORY}", history)
         messages = build_prompt(current_rgb, prompt, depth_path=current_depth)
-        response = call_vlm(messages, api_key=api_key, model=args.model)
+        response = call_vlm(messages, api_key=api_key, model=model)
 
         print(f"    VLM Response:")
         print_vlm_response(response, indent="      ")
@@ -810,7 +757,7 @@ def main():
         base_c2w = c2w.copy() if from_initial else current_c2w
         current_c2w = apply_view_request(base_c2w, req_trans, req_rot)
         current_rgb, current_depth = render_and_get_paths(
-            current_c2w, f"spatial_{idx:04d}_round{sp_round + 1}")
+            current_c2w, f"run{run_id}_spatial_{idx:04d}_round{sp_round + 1}")
 
     # ===================================================================
     # Summary
@@ -829,8 +776,186 @@ def main():
         print(f"    Confidence: {response.get('confidence', '?')}")
     print(f"{'='*70}")
 
-    # Save result
-    output = {
+    return {
+        "run_id": run_id,
+        "experiment_dir": experiment_dir,
+        "frame_index": idx,
+        "use_rendered": use_rendered,
+        "use_depth": use_depth,
+        "model": model,
+        "object_1": OBJECT_1,
+        "object_2": OBJECT_2,
+        "status": "completed",
+        "detection_rounds_count": len(detection_rounds),
+        "spatial_rounds_count": len(spatial_rounds),
+        "final_spatial_answer": {
+            "lateral": response.get("lateral", "?") if isinstance(response, dict) else "?",
+            "depth": response.get("depth", "?") if isinstance(response, dict) else "?",
+            "vertical": response.get("vertical", "?") if isinstance(response, dict) else "?",
+            "confidence": response.get("confidence", "?") if isinstance(response, dict) else "?",
+        },
+        "camera_info": camera_info,
+        "detection_planning": planning_response,
+        "detection_rounds": detection_rounds,
+        "spatial_rounds": spatial_rounds,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Minimal VLM evaluation on RGB images")
+    parser.add_argument("--experiment_dir", type=str, required=True)
+    parser.add_argument("--image_idx", type=int, required=True, help="Frame index to evaluate")
+    parser.add_argument("--use_rendered", action="store_true", help="Use rendered RGB instead of GT")
+    parser.add_argument("--use_depth", action="store_true", help="Include depth map in VLM prompt")
+    parser.add_argument("--model", type=str, default="gpt-4o")
+    parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument("--api_key", type=str, default=None)
+    args = parser.parse_args()
+
+    api_key = args.api_key or os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        print("Error: provide --api_key or set OPENAI_API_KEY")
+        sys.exit(1)
+
+    eval_dir = os.path.join(args.experiment_dir, "eval")
+    frames = load_frames_index(eval_dir)
+    camera_info = load_camera_info(eval_dir)
+
+    frame = get_frame(frames, args.image_idx)
+    if frame is None:
+        print(f"Error: frame {args.image_idx} not found in frames_index.csv")
+        sys.exit(1)
+
+    output_dir = args.output_dir or os.path.join(args.experiment_dir, str(args.image_idx))
+    os.makedirs(output_dir, exist_ok=True)
+
+    render_dir = os.path.join(output_dir, "novel_view")
+    os.makedirs(render_dir, exist_ok=True)
+
+    # Load 3DGS checkpoint and render from the frame's pose
+    print(f"Loading 3DGS checkpoint...")
+    params = load_checkpoint(args.experiment_dir)
+
+    idx = frame["index"]
+    c2w = frame["camera_pose"]
+    tx, ty, tz = c2w_to_translation(c2w)
+    roll, pitch, yaw = c2w_to_rpy_deg(c2w)
+    rgb_path = frame["gs_rgb_path"] if args.use_rendered else frame["gt_rgb_path"]
+
+    # Render initial frame
+    rendered_path = os.path.join(render_dir, f"rendered_{idx:04d}.png")
+    rendered_img = render_frame(params, idx, camera_info)
+    cv2.imwrite(rendered_path, rendered_img)
+
+    initial_depth_path = None
+    if args.use_depth:
+        initial_depth = frame["gs_depth_path"] if args.use_rendered else frame["gt_depth_path"]
+        if os.path.isfile(initial_depth):
+            initial_depth_path = initial_depth
+        else:
+            print(f"  Warning: depth not found: {initial_depth}, proceeding without")
+
+    print(f"{'='*70}")
+    print(f"  VLM Spatial Evaluation — {NUM_RUNS} runs")
+    print(f"{'='*70}")
+    print(f"  Experiment:    {args.experiment_dir}")
+    print(f"  Frame:         {idx}")
+    print(f"  Source:        {'rendered' if args.use_rendered else 'ground truth'} RGB")
+    print(f"  Depth:         {'enabled' if args.use_depth else 'disabled'}")
+    print(f"  Model:         {args.model}")
+    print(f"  Objects:       1. {OBJECT_1}")
+    print(f"                 2. {OBJECT_2}")
+    print(f"  Initial pose:  t=[{tx:.3f}, {ty:.3f}, {tz:.3f}]  rpy=[{roll:.1f}, {pitch:.1f}, {yaw:.1f}] deg")
+    print(f"  Max detection: {MAX_DETECTION_ROUNDS} rounds")
+    print(f"  Max spatial:   {MAX_SPATIAL_ROUNDS} rounds")
+    print(f"  Num runs:      {NUM_RUNS}")
+    print(f"  Trans step:    {TRANSLATION_STEP_M} m")
+    print(f"  Rot step:      {ROTATION_STEP_DEG} deg")
+    print(f"{'='*70}")
+
+    # ===================================================================
+    # Run experiments
+    # ===================================================================
+    all_results = []
+    for run_id in range(1, NUM_RUNS + 1):
+        print(f"\n{'#'*70}")
+        print(f"  RUN {run_id}/{NUM_RUNS}")
+        print(f"{'#'*70}")
+
+        result = run_single_experiment(
+            run_id=run_id,
+            params=params,
+            frame=frame,
+            camera_info=camera_info,
+            rgb_path=rgb_path,
+            initial_depth_path=initial_depth_path,
+            c2w=c2w,
+            render_dir=render_dir,
+            output_dir=output_dir,
+            api_key=api_key,
+            model=args.model,
+            use_depth=args.use_depth,
+            use_rendered=args.use_rendered,
+            experiment_dir=args.experiment_dir,
+        )
+        all_results.append(result)
+
+        # Save individual run result
+        run_path = os.path.join(output_dir, f"vlm_evaluation_run{run_id}.json")
+        with open(run_path, "w") as f:
+            json.dump(result, f, indent=2)
+        print(f"\n  Run {run_id} saved to: {run_path}")
+
+    # ===================================================================
+    # Aggregate metrics
+    # ===================================================================
+    total = len(all_results)
+    completed = [r for r in all_results if r["status"] == "completed"]
+    failed = [r for r in all_results if r["status"] == "detection_failed"]
+    num_completed = len(completed)
+    num_failed = len(failed)
+
+    detection_steps_all = [r["detection_rounds_count"] for r in all_results]
+    detection_steps_completed = [r["detection_rounds_count"] for r in completed]
+    spatial_steps_completed = [r["spatial_rounds_count"] for r in completed]
+    total_steps_completed = [r["detection_rounds_count"] + r["spatial_rounds_count"] for r in completed]
+
+    avg_detection_all = sum(detection_steps_all) / total if total > 0 else 0
+    avg_detection_completed = sum(detection_steps_completed) / num_completed if num_completed > 0 else 0
+    avg_spatial_completed = sum(spatial_steps_completed) / num_completed if num_completed > 0 else 0
+    avg_total_completed = sum(total_steps_completed) / num_completed if num_completed > 0 else 0
+
+    # Collect spatial answers
+    spatial_answers = {}
+    for r in completed:
+        ans = r.get("final_spatial_answer", {})
+        for axis in ["lateral", "depth", "vertical"]:
+            val = ans.get(axis, "?")
+            spatial_answers.setdefault(axis, {})
+            spatial_answers[axis][val] = spatial_answers[axis].get(val, 0) + 1
+
+    print(f"\n{'='*70}")
+    print(f"  AGGREGATE METRICS ({total} runs)")
+    print(f"{'='*70}")
+    print(f"  Completed:          {num_completed}/{total} ({100*num_completed/total:.0f}%)")
+    print(f"  Detection failed:   {num_failed}/{total} ({100*num_failed/total:.0f}%)")
+    print(f"  {'─'*50}")
+    print(f"  Avg detection steps (all runs):       {avg_detection_all:.1f}")
+    print(f"  Avg detection steps (completed only):  {avg_detection_completed:.1f}")
+    print(f"  Avg spatial steps (completed only):    {avg_spatial_completed:.1f}")
+    print(f"  Avg total steps (completed only):      {avg_total_completed:.1f}")
+    if spatial_answers:
+        print(f"  {'─'*50}")
+        print(f"  Spatial answer distribution (completed runs):")
+        for axis in ["lateral", "depth", "vertical"]:
+            if axis in spatial_answers:
+                dist = spatial_answers[axis]
+                dist_str = ", ".join(f"{v}: {c}" for v, c in sorted(dist.items(), key=lambda x: -x[1]))
+                print(f"    {axis:10s}: {dist_str}")
+    print(f"{'='*70}")
+
+    # Save aggregate
+    aggregate = {
         "experiment_dir": args.experiment_dir,
         "frame_index": idx,
         "use_rendered": args.use_rendered,
@@ -838,18 +963,23 @@ def main():
         "model": args.model,
         "object_1": OBJECT_1,
         "object_2": OBJECT_2,
-        "status": "completed",
-        "camera_info": camera_info,
-        "detection_planning": planning_response,
-        "detection_rounds": detection_rounds,
-        "spatial_rounds": spatial_rounds,
+        "num_runs": total,
+        "num_completed": num_completed,
+        "num_detection_failed": num_failed,
+        "success_rate": num_completed / total if total > 0 else 0,
+        "avg_detection_steps_all": avg_detection_all,
+        "avg_detection_steps_completed": avg_detection_completed,
+        "avg_spatial_steps_completed": avg_spatial_completed,
+        "avg_total_steps_completed": avg_total_completed,
+        "spatial_answer_distribution": spatial_answers,
+        "runs": all_results,
     }
 
-    out_path = os.path.join(output_dir, "vlm_evaluation.json")
-    with open(out_path, "w") as f:
-        json.dump(output, f, indent=2)
+    agg_path = os.path.join(output_dir, "vlm_evaluation_aggregate.json")
+    with open(agg_path, "w") as f:
+        json.dump(aggregate, f, indent=2)
 
-    print(f"\n  Results saved to: {out_path}")
+    print(f"\n  Aggregate results saved to: {agg_path}")
 
 
 if __name__ == "__main__":
